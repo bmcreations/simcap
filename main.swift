@@ -43,8 +43,12 @@ let inputMode = args.contains("-input")
 args.removeAll { $0 == "-input" }
 let bitRate = flag("-bitrate", 8_000_000)
 let maxFPS = flag("-fps", 60)
+// Longest edge of the encoded picture, 0 for the framebuffer's own size. The
+// framebuffer is 1206x2622 on an iPhone 17, six times the pixels of a phone
+// capped at 1080, and at that size a keyframe took 176ms to write to a viewer.
+let maxSize = flag("-maxsize", 0)
 guard let udid = args.first else {
-    FileHandle.standardError.write("usage: simcap <udid> [-bitrate bps] [-fps n] [-input]\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: simcap <udid> [-bitrate bps] [-fps n] [-maxsize px] [-input]\n".data(using: .utf8)!)
     exit(2)
 }
 
@@ -185,7 +189,10 @@ func packet(pts: UInt64, flags: UInt64, _ payload: Data) {
 
 let startCode = Data([0, 0, 0, 1])
 var session: VTCompressionSession?
-var width = 0, height = 0
+var width = 0, height = 0          // the framebuffer's
+var outWidth = 0, outHeight = 0    // the encoded picture's
+var scaler: VTPixelTransferSession?
+var scaledPool: CVPixelBufferPool?
 var lastParams = Data()
 var forceKey = true
 let encodeQueue = DispatchQueue(label: "simcap.encode", qos: .userInteractive)
@@ -258,6 +265,42 @@ func makeSession(_ w: Int, _ h: Int) {
     session = s
 }
 
+// scaledSize fits w x h inside maxSize on its longest edge, keeping the shape,
+// with both sides a multiple of 8 as scrcpy's own encoder rounds them.
+func scaledSize(_ w: Int, _ h: Int) -> (Int, Int) {
+    let long = max(w, h)
+    guard maxSize > 0, long > maxSize else { return (w, h) }
+    let f = Double(maxSize) / Double(long)
+    func r8(_ v: Int) -> Int { max(8, Int((Double(v) * f / 8).rounded()) * 8) }
+    return (r8(w), r8(h))
+}
+
+// makeScaler prepares the downscale for a framebuffer of w x h, or clears it
+// when the picture is encoded at its own size.
+func makeScaler(_ w: Int, _ h: Int) {
+    if let s = scaler { VTPixelTransferSessionInvalidate(s) }
+    scaler = nil
+    scaledPool = nil
+    guard (outWidth, outHeight) != (w, h) else { return }
+    var s: VTPixelTransferSession?
+    guard VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &s) == noErr, let s else {
+        fail("VTPixelTransferSessionCreate")
+    }
+    VTSessionSetProperty(s, key: kVTPixelTransferPropertyKey_ScalingMode, value: kVTScalingMode_Normal)
+    let attrs: [CFString: Any] = [
+        kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        kCVPixelBufferWidthKey: outWidth,
+        kCVPixelBufferHeightKey: outHeight,
+        kCVPixelBufferIOSurfacePropertiesKey: [:] as [CFString: Any],
+    ]
+    var pool: CVPixelBufferPool?
+    guard CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool) == kCVReturnSuccess, let pool else {
+        fail("CVPixelBufferPoolCreate \(outWidth)x\(outHeight)")
+    }
+    scaler = s
+    scaledPool = pool
+}
+
 // The stream header needs dimensions, so it goes out with the first surface.
 func writeHeader(_ w: Int, _ h: Int) {
     var name = Data(deviceName.utf8.prefix(63))
@@ -276,20 +319,30 @@ func encode(_ surf: IOSurface) {
     let w = surf.width, h = surf.height
     if session == nil {
         width = w; height = h
-        writeHeader(w, h)
-        makeSession(w, h)
-        log("\(deviceName) \(w)x\(h) \(bitRate)bps \(maxFPS)fps")
+        (outWidth, outHeight) = scaledSize(w, h)
+        writeHeader(outWidth, outHeight)
+        makeScaler(w, h)
+        makeSession(outWidth, outHeight)
+        log("\(deviceName) \(w)x\(h) as \(outWidth)x\(outHeight) \(bitRate)bps \(maxFPS)fps")
     } else if w != width || h != height {
         // Rotation or a resize. The wire has no way to re-announce size
         // mid-stream except through the SPS, which the config packet carries.
         VTCompressionSessionInvalidate(session!)
         width = w; height = h
-        makeSession(w, h)
+        (outWidth, outHeight) = scaledSize(w, h)
+        makeScaler(w, h)
+        makeSession(outWidth, outHeight)
         forceKey = true
     }
     var pb: Unmanaged<CVPixelBuffer>?
-    guard CVPixelBufferCreateWithIOSurface(nil, surf, nil, &pb) == kCVReturnSuccess, let pixels = pb?.takeRetainedValue() else {
+    guard CVPixelBufferCreateWithIOSurface(nil, surf, nil, &pb) == kCVReturnSuccess, var pixels = pb?.takeRetainedValue() else {
         return
+    }
+    if let scaler, let scaledPool {
+        var out: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, scaledPool, &out) == kCVReturnSuccess, let out,
+              VTPixelTransferSessionTransferImage(scaler, from: pixels, to: out) == noErr else { return }
+        pixels = out
     }
     let now = DispatchTime.now().uptimeNanoseconds
     let pts = CMTime(value: CMTimeValue((now - t0) / 1000), timescale: 1_000_000)
