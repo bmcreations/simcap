@@ -86,12 +86,12 @@ private final class HID {
         if let sendErr { throw InputError("send: \(sendErr.localizedDescription)") }
     }
 
-    enum Phase { case down, move, up }
+
 
     // The nine-argument mouse call, with the point normalised to the screen.
     // Of the two recipes tried it missed nothing in 10 open-and-close taps,
     // where the IOHIDEvent digitizer wrapper missed 3 of 16.
-    func touch(_ phase: Phase, _ nx: Double, _ ny: Double, _ w: Double, _ h: Double) throws {
+    func touch(_ phase: TouchPhase, _ nx: Double, _ ny: Double, _ w: Double, _ h: Double) throws {
         var p = CGPoint(x: nx, y: ny)
         let (event, direction): (UInt32, UInt32) = switch phase {
         case .down: (1, 1)
@@ -114,6 +114,8 @@ private final class HID {
     }
 }
 
+enum TouchPhase { case down, move, up }
+
 struct InputError: Error, CustomStringConvertible {
     let description: String
     init(_ s: String) { description = s }
@@ -121,30 +123,29 @@ struct InputError: Error, CustomStringConvertible {
 
 private let leftShift: UInt32 = 225
 
-func runInput(device: NSObject, size: @escaping () -> (Int, Int)) -> Never {
+func runInput(device: NSObject, udid: String, size: @escaping () -> (Int, Int)) -> Never {
     // Everything that builds a message runs on the main thread: the mouse
     // builder reads AppKit's per-thread state, and off the main thread the
     // simulator drops what it builds without a word.
     let hid = HID(device: device)
     log("input ready")
 
-    func handle(_ f: [Substring]) throws -> String {
+    func norm(_ x: Double, _ y: Double) throws -> (Double, Double, Double, Double) {
+        let (w, h) = size()
+        guard w > 0, h > 0 else { throw InputError("no framebuffer") }
+        return (min(max(x / Double(w), 0), 1), min(max(y / Double(h), 0), 1), Double(w), Double(h))
+    }
+
+    // Touch, tap and swipe, the same through either client.
+    func gesture(_ f: [Substring], _ touch: (TouchPhase, Double, Double, Double, Double) throws -> Void) throws -> Bool {
         func num(_ i: Int) throws -> Double {
             guard i < f.count, let v = Double(f[i]) else { throw InputError("\(f[0]): argument \(i) is not a number") }
             return v
         }
-        func norm(_ x: Double, _ y: Double) throws -> (Double, Double, Double, Double) {
-            let (w, h) = size()
-            guard w > 0, h > 0 else { throw InputError("no framebuffer") }
-            return (min(max(x / Double(w), 0), 1), min(max(y / Double(h), 0), 1), Double(w), Double(h))
-        }
         switch f[0] {
-        case "size":
-            let (w, h) = size()
-            return "ok \(w) \(h)"
         case "touch":
             guard f.count == 4 else { throw InputError("touch down|move|up X Y") }
-            let phase: HID.Phase
+            let phase: TouchPhase
             switch f[1] {
             case "down": phase = .down
             case "move": phase = .move
@@ -152,24 +153,40 @@ func runInput(device: NSObject, size: @escaping () -> (Int, Int)) -> Never {
             default: throw InputError("touch phase \(f[1])")
             }
             let (x, y, w, h) = try norm(try num(2), try num(3))
-            try hid.touch(phase, x, y, w, h)
+            try touch(phase, x, y, w, h)
         case "tap":
             let (x, y, w, h) = try norm(try num(1), try num(2))
-            try hid.touch(.down, x, y, w, h)
+            try touch(.down, x, y, w, h)
             usleep(60_000)
-            try hid.touch(.up, x, y, w, h)
+            try touch(.up, x, y, w, h)
         case "swipe":
             let (x0, y0, w, h) = try norm(try num(1), try num(2))
             let (x1, y1, _, _) = try norm(try num(3), try num(4))
             let ms = max(try num(5), 16)
             let steps = max(Int(ms / 16), 1)
-            try hid.touch(.down, x0, y0, w, h)
+            try touch(.down, x0, y0, w, h)
             for i in 1...steps {
                 usleep(useconds_t(ms * 1000 / Double(steps)))
                 let t = Double(i) / Double(steps)
-                try hid.touch(.move, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, w, h)
+                try touch(.move, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, w, h)
             }
-            try hid.touch(.up, x1, y1, w, h)
+            try touch(.up, x1, y1, w, h)
+        default:
+            return false
+        }
+        return true
+    }
+
+    func handle(_ f: [Substring]) throws -> String {
+        func num(_ i: Int) throws -> Double {
+            guard i < f.count, let v = Double(f[i]) else { throw InputError("\(f[0]): argument \(i) is not a number") }
+            return v
+        }
+        if try gesture(f, hid.touch) { return "ok" }
+        switch f[0] {
+        case "size":
+            let (w, h) = size()
+            return "ok \(w) \(h)"
         case "button":
             guard f.count == 2 else { throw InputError("button NAME") }
             switch f[1] {
@@ -206,16 +223,87 @@ func runInput(device: NSObject, size: @escaping () -> (Int, Int)) -> Never {
         return "ok " + String(decoding: data, as: UTF8.self)
     }
 
+    func front() throws -> String {
+        if tree == nil { tree = try AXTree(device: device) }
+        return "ok \(try tree!.frontPid())"
+    }
+
+    // Buttons and keys go through CoreDevice when it opens, and through the
+    // legacy client otherwise; see hub.swift for why it is all or nothing.
+    // It is opened on the first button or key, on this reader thread,
+    // because opening blocks and the main thread sends touches.
+    var hub: Result<HubHID, InputError>?
+    func route() -> HubHID? {
+        if hub == nil {
+            hub = HubHID.open(udid: udid)
+            switch hub! {
+            case .success: log("buttons and keys through CoreDevice")
+            case .failure(let e): log("buttons and keys through the legacy client: \(e)")
+            }
+        }
+        if case .success(let h) = hub! { return h }
+        return nil
+    }
+
+    // hubHandle sends one button or key through CoreDevice. Its sends are
+    // XPC and need no main thread; the probe that proved them ran on a task.
+    func hubHandle(_ h: HubHID, _ f: [Substring]) throws {
+        func usage(_ i: Int) throws -> UInt32 {
+            guard i < f.count, let v = UInt32(f[i]) else { throw InputError("\(f[0]): argument \(i) is not a number") }
+            return v
+        }
+        if try gesture(f, { p, x, y, _, _ in try h.touch(p, x, y) }) { return }
+        switch f[0] {
+        case "button":
+            guard f.count == 2 else { throw InputError("button NAME") }
+            switch f[1] {
+            case "home": try h.press(consumer: 0x40)
+            case "lock": try h.press(consumer: 0x30)
+            case "appSwitcher":
+                try h.press(consumer: 0x40)
+                usleep(150_000)
+                try h.press(consumer: 0x40)
+            default: throw InputError("unknown button \(f[1])")
+            }
+        case "key":
+            let u = try usage(1)
+            let shift = f.count > 2 && f[2] == "shift"
+            if shift { try h.key(leftShift, down: true) }
+            try h.key(u, down: true)
+            usleep(30_000)
+            try h.key(u, down: false)
+            if shift { try h.key(leftShift, down: false) }
+        default: // keydown, keyup
+            try h.key(try usage(1), down: f[0] == "keydown")
+        }
+    }
+
     Thread.detachNewThread {
         while let line = readLine() {
             let f = line.split(separator: " ")
             guard !f.isEmpty else { continue }
             var reply = ""
+            if f[0] == "route" {
+                if route() != nil {
+                    reply = "ok hub"
+                } else if case .failure(let e) = hub! {
+                    reply = "ok legacy \(e)"
+                }
+                print(reply)
+                fflush(stdout)
+                continue
+            }
+            if ["button", "key", "keydown", "keyup", "touch", "tap", "swipe"].contains(f[0]), let h = route() {
+                do { try hubHandle(h, f); reply = "ok" } catch { reply = "err \(error)" }
+                print(reply)
+                fflush(stdout)
+                continue
+            }
             // Not on the main thread: the translator blocks on each request
             // it makes, and nothing says it never needs the main thread to
             // finish one.
-            if f[0] == "ui" {
-                do { reply = try ui() } catch { reply = "err \(error)" }
+            if f[0] == "ui" || f[0] == "front" {
+                do { reply = try f[0] == "ui" ? ui() : front() } catch { reply = "err \(error)" }
                 print(reply)
                 fflush(stdout)
                 continue
