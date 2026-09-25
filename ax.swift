@@ -91,13 +91,28 @@ final class AXTree {
         }
     }
 
-    func dump() throws -> [String: Any] {
+    // frontPid is the process behind the frontmost application: SpringBoard
+    // on the Home Screen. Reclaiming restarts SpringBoard and ends every app,
+    // and this is what names the one to reopen afterwards.
+    func frontPid() throws -> Int32 {
+        let translation = try front()
+        guard let pid = (translation.value(forKey: "pid") as? NSNumber)?.int32Value, pid > 0
+        else { throw InputError("frontmost application has no pid") }
+        return pid
+    }
+
+    private func front() throws -> NSObject {
         typealias FrontFn = @convention(c) (AnyObject, Selector, UInt32, AnyObject) -> Unmanaged<AnyObject>?
         let frontSel = NSSelectorFromString("frontmostApplicationWithDisplayId:bridgeDelegateToken:")
         guard let imp = class_getMethodImplementation(type(of: translator), frontSel),
               let translation = unsafeBitCast(imp, to: FrontFn.self)(translator, frontSel, 0, token)?.takeUnretainedValue() as? NSObject
         else { throw InputError("no frontmost application") }
         translation.setValue(token, forKey: "bridgeDelegateToken")
+        return translation
+    }
+
+    func dump() throws -> [String: Any] {
+        let translation = try front()
         guard let root = translator.perform(NSSelectorFromString("macPlatformElementFromTranslation:"), with: translation)?
             .takeUnretainedValue() as? NSObject
         else { throw InputError("no element for the frontmost application") }

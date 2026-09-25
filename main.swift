@@ -36,7 +36,7 @@ func flag(_ name: String, _ def: Int) -> Int {
 // -caps lets the server tell a build with input from an older one, which
 // would read -input as nothing and start streaming video into the reply pipe.
 if args == ["-caps"] {
-    print("video\ninput\nui")
+    print("video\ninput\nui\nroute")
     exit(0)
 }
 let inputMode = args.contains("-input")
@@ -153,7 +153,7 @@ func currentSurface() -> IOSurface? {
 }
 
 if inputMode {
-    runInput(device: device) {
+    runInput(device: device, udid: udid) {
         guard let s = currentSurface() else { return (0, 0) }
         return (s.width, s.height)
     }
