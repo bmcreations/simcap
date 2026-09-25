@@ -103,4 +103,17 @@ final class HubHID {
         try digitizer.send(pointOne: DigitizerPoint(x: x, y: y), pointTwo: nil, eventType: type, edge: .none, target: .mainScreen)
         digitizer.sendBarrier()
     }
+
+    // Two fingers in one event, which is what pinch and two-finger rotate
+    // need: the legacy mouse builder carries a single point.
+    func touch2(_ phase: TouchPhase, _ x0: Double, _ y0: Double, _ x1: Double, _ y1: Double) throws {
+        let type: DigitizerEventType = switch phase {
+        case .down: .start
+        case .move: .position
+        case .up: .end
+        }
+        try digitizer.send(pointOne: DigitizerPoint(x: x0, y: y0), pointTwo: DigitizerPoint(x: x1, y: y1),
+                           eventType: type, edge: .none, target: .mainScreen)
+        digitizer.sendBarrier()
+    }
 }
