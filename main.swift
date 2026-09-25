@@ -4,6 +4,8 @@
 // packet with the config and keyframe flags in bits 63 and 62.
 //
 //   simcap <udid> [-bitrate bps] [-fps n]
+//   simcap <udid> -input       inject input instead; see input.swift
+//   simcap -caps               print what this build can do, one per line
 //
 // The framebuffer is reached through CoreSimulator and SimulatorKit, which are
 // private and move with Xcode, so this is built on its own rather than by
@@ -31,10 +33,18 @@ func flag(_ name: String, _ def: Int) -> Int {
     args.removeSubrange(i...(i + 1))
     return v
 }
+// -caps lets the server tell a build with input from an older one, which
+// would read -input as nothing and start streaming video into the reply pipe.
+if args == ["-caps"] {
+    print("video\ninput\nui")
+    exit(0)
+}
+let inputMode = args.contains("-input")
+args.removeAll { $0 == "-input" }
 let bitRate = flag("-bitrate", 8_000_000)
 let maxFPS = flag("-fps", 60)
 guard let udid = args.first else {
-    FileHandle.standardError.write("usage: simcap <udid> [-bitrate bps] [-fps n]\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: simcap <udid> [-bitrate bps] [-fps n] [-input]\n".data(using: .utf8)!)
     exit(2)
 }
 
@@ -140,6 +150,13 @@ func currentSurface() -> IOSurface? {
         if best == nil || surf.width * surf.height > best!.width * best!.height { best = surf }
     }
     return best
+}
+
+if inputMode {
+    runInput(device: device) {
+        guard let s = currentSurface() else { return (0, 0) }
+        return (s.width, s.height)
+    }
 }
 
 // MARK: - output
