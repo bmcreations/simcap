@@ -11,6 +11,9 @@
 //   touch down|move|up X Y
 //   tap X Y
 //   swipe X0 Y0 X1 Y1 MS
+//   touch2 down|move|up X0 Y0 X1 Y1   two fingers, CoreDevice only
+//   pinch X Y FROM TO MS       two fingers either side of X,Y on a level
+//                              line, FROM px apart moving to TO px apart
 //   button home|lock|appSwitcher
 //   key USAGE [shift]          press and release one HID keyboard usage
 //   keydown USAGE | keyup USAGE
@@ -245,6 +248,50 @@ func runInput(device: NSObject, udid: String, size: @escaping () -> (Int, Int)) 
         return nil
     }
 
+    // Two-finger gestures exist only on the CoreDevice route: the legacy
+    // client's mouse builder takes one point.
+    func twoFinger(_ f: [Substring], _ h: HubHID) throws -> Bool {
+        func num(_ i: Int) throws -> Double {
+            guard i < f.count, let v = Double(f[i]) else { throw InputError("\(f[0]): argument \(i) is not a number") }
+            return v
+        }
+        switch f[0] {
+        case "touch2":
+            guard f.count == 6 else { throw InputError("touch2 down|move|up X0 Y0 X1 Y1") }
+            let phase: TouchPhase
+            switch f[1] {
+            case "down": phase = .down
+            case "move": phase = .move
+            case "up": phase = .up
+            default: throw InputError("touch2 phase \(f[1])")
+            }
+            let (x0, y0, _, _) = try norm(try num(2), try num(3))
+            let (x1, y1, _, _) = try norm(try num(4), try num(5))
+            try h.touch2(phase, x0, y0, x1, y1)
+        case "pinch":
+            guard f.count == 6 else { throw InputError("pinch X Y FROM TO MS") }
+            let (cx, cy, from, to) = (try num(1), try num(2), try num(3) / 2, try num(4) / 2)
+            let ms = max(try num(5), 16)
+            let steps = max(Int(ms / 16), 1)
+            func at(_ r: Double) throws -> (Double, Double, Double, Double) {
+                let (x0, y0, _, _) = try norm(cx - r, cy)
+                let (x1, y1, _, _) = try norm(cx + r, cy)
+                return (x0, y0, x1, y1)
+            }
+            var p = try at(from)
+            try h.touch2(.down, p.0, p.1, p.2, p.3)
+            for i in 1...steps {
+                usleep(useconds_t(ms * 1000 / Double(steps)))
+                p = try at(from + (to - from) * Double(i) / Double(steps))
+                try h.touch2(.move, p.0, p.1, p.2, p.3)
+            }
+            try h.touch2(.up, p.0, p.1, p.2, p.3)
+        default:
+            return false
+        }
+        return true
+    }
+
     // hubHandle sends one button or key through CoreDevice. Its sends are
     // XPC and need no main thread; the probe that proved them ran on a task.
     func hubHandle(_ h: HubHID, _ f: [Substring]) throws {
@@ -253,6 +300,7 @@ func runInput(device: NSObject, udid: String, size: @escaping () -> (Int, Int)) 
             return v
         }
         if try gesture(f, { p, x, y, _, _ in try h.touch(p, x, y) }) { return }
+        if try twoFinger(f, h) { return }
         switch f[0] {
         case "button":
             guard f.count == 2 else { throw InputError("button NAME") }
@@ -293,7 +341,12 @@ func runInput(device: NSObject, udid: String, size: @escaping () -> (Int, Int)) 
                 fflush(stdout)
                 continue
             }
-            if ["button", "key", "keydown", "keyup", "touch", "tap", "swipe"].contains(f[0]), let h = route() {
+            if ["touch2", "pinch"].contains(f[0]), route() == nil {
+                print("err \(f[0]) needs CoreDevice, which did not open")
+                fflush(stdout)
+                continue
+            }
+            if ["button", "key", "keydown", "keyup", "touch", "tap", "swipe", "touch2", "pinch"].contains(f[0]), let h = route() {
                 do { try hubHandle(h, f); reply = "ok" } catch { reply = "err \(error)" }
                 print(reply)
                 fflush(stdout)
