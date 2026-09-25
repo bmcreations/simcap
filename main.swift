@@ -16,7 +16,9 @@
 // wait forever (trap 22's blank canvas), and keep re-encoding on an idle floor
 // so a keyframe is always within reach. It exits when stdin closes, which is
 // how the parent says it is done. A byte of 17 on stdin, scrcpy's
-// TYPE_RESET_VIDEO, forces the next frame to be a keyframe.
+// TYPE_RESET_VIDEO, forces the next frame to be a keyframe. A byte of 0x80
+// followed by a big-endian u32 sets the average bitrate on the running
+// encoder, which scrcpy has no way to do.
 
 import CoreMedia
 import CoreVideo
@@ -36,12 +38,14 @@ func flag(_ name: String, _ def: Int) -> Int {
 // -caps lets the server tell a build with input from an older one, which
 // would read -input as nothing and start streaming video into the reply pipe.
 if args == ["-caps"] {
-    print("video\ninput\nui\nroute")
+    print("video\ninput\nui\nroute\nbitrate")
     exit(0)
 }
 let inputMode = args.contains("-input")
 args.removeAll { $0 == "-input" }
-let bitRate = flag("-bitrate", 8_000_000)
+// A var because stdin can change it; a session rebuilt for a new shape keeps
+// the rate last set rather than going back to the flag's.
+var bitRate = flag("-bitrate", 8_000_000)
 let maxFPS = flag("-fps", 60)
 // Longest edge of the encoded picture, 0 for the framebuffer's own size. The
 // framebuffer is 1206x2622 on an iPhone 17, six times the pixels of a phone
@@ -394,13 +398,38 @@ idle.setEventHandler {
 }
 idle.resume()
 
-// stdin: EOF means stop; byte 17 asks for a keyframe.
+// setBitRate changes the running encoder's target. Runs on encodeQueue, which
+// owns the session.
+func setBitRate(_ bps: Int) {
+    bitRate = bps
+    guard let s = session else { return }
+    let st = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bps as CFTypeRef)
+    log("bitrate \(bps)bps\(st == noErr ? "" : " failed: \(st)")")
+}
+
+// stdin: EOF means stop; byte 17 asks for a keyframe; 0x80 and a u32 sets the
+// bitrate. Parsed as a stream rather than scanned for 17, because the u32 can
+// contain one.
 Thread.detachNewThread {
     var b = [UInt8](repeating: 0, count: 64)
+    var q: [UInt8] = []
     while true {
         let n = read(0, &b, b.count)
         if n <= 0 { exit(0) }
-        if b[0..<n].contains(17) { encodeQueue.async { forceKey = true } }
+        q += b[0..<n]
+        while let op = q.first {
+            if op == 17 {
+                q.removeFirst()
+                encodeQueue.async { forceKey = true }
+            } else if op == 0x80 {
+                guard q.count >= 5 else { break }
+                let bps = q[1...4].reduce(0) { $0 << 8 | Int($1) }
+                q.removeFirst(5)
+                encodeQueue.async { setBitRate(bps) }
+            } else {
+                q.removeFirst()
+            }
+        }
     }
 }
 
