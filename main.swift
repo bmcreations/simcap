@@ -1,0 +1,337 @@
+// simcap streams one iOS simulator's screen as H.264, in scrcpy's video wire
+// format, so the Go side reads it with the same parser it uses for a device:
+// a 64-byte device name, 12 bytes of codec meta, then a 12-byte header per
+// packet with the config and keyframe flags in bits 63 and 62.
+//
+//   simcap <udid> [-bitrate bps] [-fps n]
+//
+// The framebuffer is reached through CoreSimulator and SimulatorKit, which are
+// private and move with Xcode, so this is built on its own rather than by
+// `make build`.
+//
+// Two things it must do that a change-driven capture does not: send a frame at
+// startup, because a static screen composites nothing and the viewer would
+// wait forever (trap 22's blank canvas), and keep re-encoding on an idle floor
+// so a keyframe is always within reach. It exits when stdin closes, which is
+// how the parent says it is done. A byte of 17 on stdin, scrcpy's
+// TYPE_RESET_VIDEO, forces the next frame to be a keyframe.
+
+import CoreMedia
+import CoreVideo
+import Foundation
+import IOSurface
+import ObjectiveC
+import VideoToolbox
+
+// MARK: - arguments
+
+var args = Array(CommandLine.arguments.dropFirst())
+func flag(_ name: String, _ def: Int) -> Int {
+    guard let i = args.firstIndex(of: name), i + 1 < args.count, let v = Int(args[i + 1]) else { return def }
+    args.removeSubrange(i...(i + 1))
+    return v
+}
+let bitRate = flag("-bitrate", 8_000_000)
+let maxFPS = flag("-fps", 60)
+guard let udid = args.first else {
+    FileHandle.standardError.write("usage: simcap <udid> [-bitrate bps] [-fps n]\n".data(using: .utf8)!)
+    exit(2)
+}
+
+func fail(_ msg: String) -> Never {
+    FileHandle.standardError.write("simcap: \(msg)\n".data(using: .utf8)!)
+    exit(1)
+}
+func log(_ msg: String) {
+    FileHandle.standardError.write("simcap: \(msg)\n".data(using: .utf8)!)
+}
+
+// MARK: - private frameworks
+
+func developerDir() -> String {
+    if let d = ProcessInfo.processInfo.environment["DEVELOPER_DIR"] { return d }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
+    p.arguments = ["-p"]
+    let out = Pipe()
+    p.standardOutput = out
+    try? p.run()
+    p.waitUntilExit()
+    let s = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return s.isEmpty ? "/Applications/Xcode.app/Contents/Developer" : s
+}
+
+let devDir = developerDir()
+let coreSim = "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/CoreSimulator"
+if dlopen(coreSim, RTLD_NOW | RTLD_GLOBAL) == nil { fail("dlopen \(coreSim): \(String(cString: dlerror()))") }
+// SimulatorKit has lived under Developer/Library/PrivateFrameworks and, in
+// Xcode 27, under Contents/SharedFrameworks. Neither is promised.
+let simKits = [
+    devDir + "/../SharedFrameworks/SimulatorKit.framework/SimulatorKit",
+    devDir + "/Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit",
+]
+if !simKits.contains(where: { dlopen($0, RTLD_NOW | RTLD_GLOBAL) != nil }) {
+    fail("SimulatorKit not found under \(devDir)")
+}
+
+// Calls a selector taking (arg, NSError**) or (NSError**) and returning an object.
+func callWithError(_ target: AnyObject, _ sel: Selector, _ arg: AnyObject?) -> AnyObject? {
+    let isClass = object_isClass(target)
+    let cls: AnyClass = isClass ? object_getClass(target)! : type(of: target)
+    guard let m = isClass ? class_getClassMethod(target as? AnyClass, sel) : class_getInstanceMethod(cls, sel) else {
+        return nil
+    }
+    let imp = method_getImplementation(m)
+    var err: NSError?
+    if let arg {
+        typealias Fn = @convention(c) (AnyObject, Selector, AnyObject, AutoreleasingUnsafeMutablePointer<NSError?>) -> Unmanaged<AnyObject>?
+        return withUnsafeMutablePointer(to: &err) { p in
+            unsafeBitCast(imp, to: Fn.self)(target, sel, arg, AutoreleasingUnsafeMutablePointer(p))?.takeUnretainedValue()
+        }
+    }
+    typealias Fn = @convention(c) (AnyObject, Selector, AutoreleasingUnsafeMutablePointer<NSError?>) -> Unmanaged<AnyObject>?
+    return withUnsafeMutablePointer(to: &err) { p in
+        unsafeBitCast(imp, to: Fn.self)(target, sel, AutoreleasingUnsafeMutablePointer(p))?.takeUnretainedValue()
+    }
+}
+
+guard let ctxClass = NSClassFromString("SimServiceContext"),
+      let ctx = callWithError(ctxClass, NSSelectorFromString("sharedServiceContextForDeveloperDir:error:"), devDir as NSString),
+      let set = callWithError(ctx, NSSelectorFromString("defaultDeviceSetWithError:"), nil) as? NSObject,
+      let devices = set.value(forKey: "devices") as? [NSObject]
+else { fail("no CoreSimulator device set") }
+
+guard let device = devices.first(where: { ($0.value(forKey: "UDID") as? NSUUID)?.uuidString == udid.uppercased() })
+else { fail("no simulator \(udid)") }
+let deviceName = (device.value(forKey: "name") as? String) ?? "Simulator"
+guard (device.value(forKey: "state") as? NSNumber)?.intValue == 3 else { fail("\(deviceName) is not booted") }
+
+guard let io = device.perform(NSSelectorFromString("io"))?.takeUnretainedValue() as? NSObject else {
+    fail("device has no io client")
+}
+
+func displayDescriptors() -> [NSObject] {
+    guard let ports = io.value(forKey: "deviceIOPorts") as? [NSObject] else { return [] }
+    return ports.compactMap { port in
+        guard let id = port.perform(NSSelectorFromString("portIdentifier"))?.takeUnretainedValue(),
+              "\(id)" == "com.apple.framebuffer.display",
+              let desc = port.perform(NSSelectorFromString("descriptor"))?.takeUnretainedValue() as? NSObject,
+              desc.responds(to: NSSelectorFromString("framebufferSurface"))
+        else { return nil }
+        return desc
+    }
+}
+
+var descriptors = displayDescriptors()
+if descriptors.isEmpty {
+    io.perform(NSSelectorFromString("updateIOPorts"))
+    descriptors = displayDescriptors()
+}
+guard !descriptors.isEmpty else { fail("no framebuffer display port") }
+
+// The main display is the largest surface. A phone has one; the others are
+// overlays or external displays.
+func currentSurface() -> IOSurface? {
+    var best: IOSurface?
+    for d in descriptors {
+        guard let s = d.perform(NSSelectorFromString("framebufferSurface"))?.takeUnretainedValue() else { continue }
+        let surf = unsafeBitCast(s, to: IOSurface.self)
+        if best == nil || surf.width * surf.height > best!.width * best!.height { best = surf }
+    }
+    return best
+}
+
+// MARK: - output
+
+let out = FileHandle.standardOutput
+signal(SIGPIPE, SIG_IGN)
+let writeLock = NSLock()
+
+func write(_ data: Data) {
+    writeLock.lock()
+    defer { writeLock.unlock() }
+    do { try out.write(contentsOf: data) } catch { exit(0) } // the reader is gone
+}
+
+func be64(_ v: UInt64) -> Data { withUnsafeBytes(of: v.bigEndian) { Data($0) } }
+func be32(_ v: UInt32) -> Data { withUnsafeBytes(of: v.bigEndian) { Data($0) } }
+
+let flagConfig: UInt64 = 1 << 63
+let flagKey: UInt64 = 1 << 62
+
+func packet(pts: UInt64, flags: UInt64, _ payload: Data) {
+    write(be64(pts | flags) + be32(UInt32(payload.count)) + payload)
+}
+
+// MARK: - encoder
+
+let startCode = Data([0, 0, 0, 1])
+var session: VTCompressionSession?
+var width = 0, height = 0
+var lastParams = Data()
+var forceKey = true
+let encodeQueue = DispatchQueue(label: "simcap.encode", qos: .userInteractive)
+let t0 = DispatchTime.now().uptimeNanoseconds
+
+func annexB(_ sbuf: CMSampleBuffer) {
+    guard let block = CMSampleBufferGetDataBuffer(sbuf), let fmt = CMSampleBufferGetFormatDescription(sbuf) else { return }
+    let attachments = CMSampleBufferGetSampleAttachmentsArray(sbuf, createIfNecessary: false) as? [[CFString: Any]]
+    let key = !(attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
+    let pts = UInt64(max(0, CMSampleBufferGetPresentationTimeStamp(sbuf).seconds) * 1_000_000)
+
+    var nalLen: Int32 = 4
+    if key {
+        var params = Data()
+        var count = 0
+        CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, parameterSetIndex: 0, parameterSetPointerOut: nil,
+                                                           parameterSetSizeOut: nil, parameterSetCountOut: &count,
+                                                           nalUnitHeaderLengthOut: &nalLen)
+        for i in 0..<count {
+            var ptr: UnsafePointer<UInt8>?
+            var size = 0
+            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, parameterSetIndex: i, parameterSetPointerOut: &ptr,
+                                                               parameterSetSizeOut: &size, parameterSetCountOut: nil,
+                                                               nalUnitHeaderLengthOut: nil)
+            if let ptr { params += startCode + Data(bytes: ptr, count: size) }
+        }
+        if params != lastParams {
+            lastParams = params
+            packet(pts: 0, flags: flagConfig, params)
+        }
+    }
+
+    var total = 0
+    var raw: UnsafeMutablePointer<CChar>?
+    guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &total,
+                                      dataPointerOut: &raw) == noErr, let raw else { return }
+    var payload = Data(capacity: total)
+    var off = 0
+    let n = Int(nalLen)
+    while off + n <= total {
+        var len = 0
+        for i in 0..<n { len = len << 8 | Int(UInt8(bitPattern: raw[off + i])) }
+        off += n
+        guard off + len <= total else { break }
+        payload += startCode
+        payload.append(UnsafeRawPointer(raw + off).assumingMemoryBound(to: UInt8.self), count: len)
+        off += len
+    }
+    packet(pts: pts, flags: key ? flagKey : 0, payload)
+}
+
+func makeSession(_ w: Int, _ h: Int) {
+    var s: VTCompressionSession?
+    let spec: [CFString: Any] = [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true]
+    let st = VTCompressionSessionCreate(allocator: nil, width: Int32(w), height: Int32(h), codecType: kCMVideoCodecType_H264,
+                                        encoderSpecification: spec as CFDictionary, imageBufferAttributes: nil,
+                                        compressedDataAllocator: nil, outputCallback: nil, refcon: nil,
+                                        compressionSessionOut: &s)
+    guard st == noErr, let s else { fail("VTCompressionSessionCreate: \(st)") }
+    let props: [CFString: Any] = [
+        kVTCompressionPropertyKey_RealTime: true,
+        kVTCompressionPropertyKey_AllowFrameReordering: false,
+        kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_H264_High_AutoLevel,
+        kVTCompressionPropertyKey_AverageBitRate: bitRate,
+        kVTCompressionPropertyKey_ExpectedFrameRate: maxFPS,
+        kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 1.0,
+    ]
+    for (k, v) in props { VTSessionSetProperty(s, key: k, value: v as CFTypeRef) }
+    VTCompressionSessionPrepareToEncodeFrames(s)
+    session = s
+}
+
+// The stream header needs dimensions, so it goes out with the first surface.
+func writeHeader(_ w: Int, _ h: Int) {
+    var name = Data(deviceName.utf8.prefix(63))
+    name += Data(count: 64 - name.count)
+    write(name + be32(0x6832_3634) + be32(UInt32(w)) + be32(UInt32(h))) // "h264"
+}
+
+var frames = 0
+var lastEncode: UInt64 = 0
+// Three quarters of the interval, not the whole of it. The simulator composites
+// at 60Hz with jitter, so spacing captures by a full 16.7ms made every callback
+// that landed a little early wait for the next one: 60fps in, 50 out.
+let minGap = UInt64(1_000_000_000 / max(1, maxFPS)) * 3 / 4
+
+func encode(_ surf: IOSurface) {
+    let w = surf.width, h = surf.height
+    if session == nil {
+        width = w; height = h
+        writeHeader(w, h)
+        makeSession(w, h)
+        log("\(deviceName) \(w)x\(h) \(bitRate)bps \(maxFPS)fps")
+    } else if w != width || h != height {
+        // Rotation or a resize. The wire has no way to re-announce size
+        // mid-stream except through the SPS, which the config packet carries.
+        VTCompressionSessionInvalidate(session!)
+        width = w; height = h
+        makeSession(w, h)
+        forceKey = true
+    }
+    var pb: Unmanaged<CVPixelBuffer>?
+    guard CVPixelBufferCreateWithIOSurface(nil, surf, nil, &pb) == kCVReturnSuccess, let pixels = pb?.takeRetainedValue() else {
+        return
+    }
+    let now = DispatchTime.now().uptimeNanoseconds
+    let pts = CMTime(value: CMTimeValue((now - t0) / 1000), timescale: 1_000_000)
+    let opts: [CFString: Any]? = forceKey ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] : nil
+    forceKey = false
+    lastEncode = now
+    frames += 1
+    VTCompressionSessionEncodeFrame(session!, imageBuffer: pixels, presentationTimeStamp: pts, duration: .invalid,
+                                    frameProperties: opts as CFDictionary?, infoFlagsOut: nil) { st, _, sbuf in
+        if st == noErr, let sbuf { annexB(sbuf) }
+    }
+}
+
+// Coalesces composite callbacks: at most one capture is queued, and captures
+// are spaced by the frame interval.
+var pending = false
+func schedule() {
+    encodeQueue.async {
+        if pending { return }
+        pending = true
+        let now = DispatchTime.now().uptimeNanoseconds
+        let wait = lastEncode + minGap > now ? lastEncode + minGap - now : 0
+        encodeQueue.asyncAfter(deadline: .now() + .nanoseconds(Int(wait))) {
+            pending = false
+            autoreleasepool { if let s = currentSurface() { encode(s) } }
+        }
+    }
+}
+
+// MARK: - wiring
+
+let register = NSSelectorFromString("registerScreenCallbacksWithUUID:callbackQueue:frameCallback:surfacesChangedCallback:propertiesChangedCallback:")
+let callbackQueue = DispatchQueue(label: "simcap.callbacks")
+for d in descriptors where d.responds(to: register) {
+    let changed: @convention(block) () -> Void = { schedule() }
+    let props: @convention(block) () -> Void = {}
+    typealias Fn = @convention(c) (AnyObject, Selector, AnyObject, AnyObject, AnyObject, AnyObject, AnyObject) -> Void
+    let imp = class_getMethodImplementation(type(of: d), register)!
+    unsafeBitCast(imp, to: Fn.self)(d, register, NSUUID(), callbackQueue, changed as AnyObject, changed as AnyObject, props as AnyObject)
+}
+
+// The idle floor: a static screen composites nothing, so re-encode what is
+// there every 250ms. That is what gets a frame out at startup and keeps the
+// one-second keyframe interval honest on a screen nobody is touching.
+let idle = DispatchSource.makeTimerSource(queue: encodeQueue)
+idle.schedule(deadline: .now(), repeating: .milliseconds(250))
+idle.setEventHandler {
+    if DispatchTime.now().uptimeNanoseconds - lastEncode >= 250_000_000 { schedule() }
+}
+idle.resume()
+
+// stdin: EOF means stop; byte 17 asks for a keyframe.
+Thread.detachNewThread {
+    var b = [UInt8](repeating: 0, count: 64)
+    while true {
+        let n = read(0, &b, b.count)
+        if n <= 0 { exit(0) }
+        if b[0..<n].contains(17) { encodeQueue.async { forceKey = true } }
+    }
+}
+
+dispatchMain()
