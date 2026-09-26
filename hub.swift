@@ -27,9 +27,20 @@ private let coreDevicePath = "/Library/Developer/PrivateFrameworks/CoreDevice.fr
 // Generic and unoptimised, so A.ProtocolType is read from the real
 // conformance at run time rather than from the stub's placeholder alias.
 @inline(never) @_optimize(none)
-private func implementation<A: DeviceCapability>(_ d: RemoteDevice, _ m: CapabilityStaticMember<A>) async throws -> Any {
+func implementation<A: DeviceCapability>(_ d: RemoteDevice, _ m: CapabilityStaticMember<A>) async throws -> Any {
     let impl: A.ProtocolType = try await d.getImplementation(for: m)
     return impl as Any
+}
+
+// coreDevice finds the simulator among the devices CoreDevice lists.
+// DeviceManager.shared lists only physical devices, so this builds its own
+// manager with simulators allowed.
+func coreDevice(_ want: UUID) async -> RemoteDevice? {
+    let mgr = DeviceManager(serviceConnection: CoreDeviceService.sharedConnection,
+                            allowedDeviceVisibilityClasses: [.default, .simulators])
+    await mgr.waitForPostPluginLoadCheckIn()
+    await mgr.awaitFullInitialization()
+    return mgr.allDevices().first(where: { $0.deviceIdentifier == want })
 }
 
 final class HubHID {
@@ -54,11 +65,7 @@ final class HubHID {
         let done = DispatchSemaphore(value: 0)
         Task.detached {
             defer { done.signal() }
-            let mgr = DeviceManager(serviceConnection: CoreDeviceService.sharedConnection,
-                                    allowedDeviceVisibilityClasses: [.default, .simulators])
-            await mgr.waitForPostPluginLoadCheckIn()
-            await mgr.awaitFullInitialization()
-            guard let dev = mgr.allDevices().first(where: { $0.deviceIdentifier == want }) else {
+            guard let dev = await coreDevice(want) else {
                 result = .failure(InputError("CoreDevice does not list \(udid)"))
                 return
             }

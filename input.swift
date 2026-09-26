@@ -349,6 +349,7 @@ func runInput(device: NSObject, udid: String, size: @escaping () -> (Int, Int)) 
         }
     }
 
+    var pasteboard: Result<HubPasteboard, InputError>?
     Thread.detachNewThread {
         while let line = readLine() {
             let f = line.split(separator: " ")
@@ -385,6 +386,34 @@ func runInput(device: NSObject, udid: String, size: @escaping () -> (Int, Int)) 
                     do { try setHardwareKeyboard(device, f[1] == "on"); reply = "ok" } catch { reply = "err \(error)" }
                 } else {
                     reply = "err hwkeyboard on|off"
+                }
+                print(reply)
+                fflush(stdout)
+                continue
+            }
+            // The pasteboard is CoreDevice's too, opened on first use.
+            // `pbget` answers `ok <base64>`; `pbset <base64>` sets it. An
+            // empty pasteboard is `ok` with nothing after it.
+            if f[0] == "pbget" || f[0] == "pbset" {
+                do {
+                    if pasteboard == nil { pasteboard = HubPasteboard.open(udid: udid) }
+                    let pb = try pasteboard!.get()
+                    if f[0] == "pbget" {
+                        let b64 = Data(try pb.text().utf8).base64EncodedString()
+                        reply = b64.isEmpty ? "ok" : "ok \(b64)"
+                    } else {
+                        guard let data = Data(base64Encoded: f.count > 1 ? String(f[1]) : ""),
+                              let text = String(data: data, encoding: .utf8)
+                        else { throw InputError("pbset BASE64") }
+                        try pb.setText(text)
+                        reply = "ok"
+                    }
+                } catch {
+                    // A failed open is retried on the next call rather than
+                    // remembered: CoreDevice may simply not have listed the
+                    // simulator yet.
+                    if case .failure = pasteboard { pasteboard = nil }
+                    reply = "err \(error)"
                 }
                 print(reply)
                 fflush(stdout)

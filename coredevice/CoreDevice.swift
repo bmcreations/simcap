@@ -1,6 +1,7 @@
 // Declarations only, matching the mangled names CoreDevice.framework exports
 // on Xcode 27. Compiled into a .swiftmodule and never linked: simcap
 // links the real framework.
+import AppKit
 import Foundation
 
 public enum HIDButtonState: UInt8 { case up, down }
@@ -89,4 +90,45 @@ public struct DigitizerHIDCapability: DeviceCapability {
 }
 extension CapabilityStaticMember where A == HIDDeviceCapability {
   public static var digitizer: CapabilityStaticMember<DigitizerHIDCapability> { fatalError() }
+}
+
+// The pasteboard, which Device Hub syncs through. The snapshot types live in
+// CoreDeviceUtilities and are mangled under that module; the error lives
+// there too and is mangled under this one, so each names where its symbols
+// say it was defined.
+@available(macOS 10.10, *)
+@_originallyDefinedIn(module: "CoreDevice", macOS 10.10)
+public struct CoreDeviceError: Error {}
+
+@available(macOS 10.10, *)
+@_originallyDefinedIn(module: "CoreDeviceUtilities", macOS 10.10)
+public enum PasteboardDataInclusionPolicy {
+  case allPromised, allResolved, matchSource, promiseSecondary
+  case thresholdData(Int64)
+}
+
+@available(macOS 10.10, *)
+@_originallyDefinedIn(module: "CoreDeviceUtilities", macOS 10.10)
+public struct PasteboardSnapshot {
+  public init(from: NSPasteboard, dataPolicy: PasteboardDataInclusionPolicy) throws(CoreDeviceError) { fatalError() }
+  public func write(to: NSPasteboard) throws(CoreDeviceError) -> Int { fatalError() }
+  public var containsConfidentialContent: Bool { fatalError() }
+}
+
+public final class PasteboardMonitorSession {
+  public var snapshotStream: AsyncThrowingStream<PasteboardSnapshot, Error> { fatalError() }
+  public func invalidate() {}
+}
+
+public protocol PasteboardProtocol: DeviceCapabilityProtocol {
+  func currentPasteboardSnapshot(pasteboardName: String, dataPolicy: PasteboardDataInclusionPolicy) async throws(CoreDeviceError) -> PasteboardSnapshot
+  func monitorPasteboardChanges(pasteboardName: String, dataPolicy: PasteboardDataInclusionPolicy, includeInitialState: Bool) async throws(CoreDeviceError) -> PasteboardMonitorSession
+  func setPasteboardContents(pasteboardName: String, pasteboardSnapshot: PasteboardSnapshot) async throws(CoreDeviceError) -> PasteboardSnapshot
+}
+public struct PasteboardCapability: DeviceCapability {
+  public typealias ProtocolType = Any
+  public typealias ImplType = Any
+}
+extension CapabilityStaticMember where A: DeviceCapability {
+  public static var pasteboard: CapabilityStaticMember<PasteboardCapability> { fatalError() }
 }
