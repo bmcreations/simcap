@@ -5,6 +5,7 @@
 //
 //   simcap <udid> [-bitrate bps] [-fps n]
 //   simcap <udid> -input       inject input instead; see input.swift
+//   simcap <udid> -pasteboard  print the pasteboard on each change; see pasteboard.swift
 //   simcap -caps               print what this build can do, one per line
 //
 // The framebuffer is reached through CoreSimulator and SimulatorKit, which are
@@ -38,8 +39,11 @@ func flag(_ name: String, _ def: Int) -> Int {
 // -caps lets the server tell a build with input from an older one, which
 // would read -input as nothing and start streaming video into the reply pipe.
 if args == ["-caps"] {
-    print("video\ninput\nui\nroute\nbitrate")
+    print("video\ninput\nui\nroute\nbitrate\npasteboard")
     exit(0)
+}
+if args.count == 2, args[1] == "-pasteboard" {
+    runPasteboardWatch(udid: args[0])
 }
 let inputMode = args.contains("-input")
 args.removeAll { $0 == "-input" }
