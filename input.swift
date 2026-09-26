@@ -19,6 +19,8 @@
 //   keydown USAGE | keyup USAGE
 //   size                       -> ok W H
 //   ui                         -> ok {json}, the accessibility tree (ax.swift)
+//   hwkeyboard on|off          connect or disconnect the hardware keyboard,
+//                              which hides or restores the on-screen one
 //
 // Measured on an iPhone 17 simulator, iOS 27.0, Xcode 27.0: every message
 // completed in 1-3ms. The builders are private and moved in iOS 26 -- the
@@ -125,6 +127,27 @@ struct InputError: Error, CustomStringConvertible {
 }
 
 private let leftShift: UInt32 = 225
+
+// setHardwareKeyboard is Simulator.app's "Connect Hardware Keyboard". With it
+// on, iOS stops raising its own keyboard for a focused field and takes typing
+// from HID keys, which is what a viewer typing on its phone sends. The method
+// is on SimDevice and reports its encoding as B32@0:8B16C20^@24: a BOOL, an
+// unsigned char keyboard type, and an NSError**. Type 0 is the one that was
+// run. CoreSimulator has no getter, and the simulator's own
+// HardwareKeyboardLastSeen stays 1 after it is turned off, so nothing reads
+// the state back.
+private func setHardwareKeyboard(_ device: NSObject, _ on: Bool) throws {
+    let sel = NSSelectorFromString("setHardwareKeyboardEnabled:keyboardType:error:")
+    guard let imp = class_getMethodImplementation(type(of: device), sel), device.responds(to: sel) else {
+        throw InputError("SimDevice has no setHardwareKeyboardEnabled:keyboardType:error:")
+    }
+    typealias Fn = @convention(c) (AnyObject, Selector, ObjCBool, UInt8, AutoreleasingUnsafeMutablePointer<NSError?>) -> ObjCBool
+    var err: NSError?
+    let ok = withUnsafeMutablePointer(to: &err) {
+        unsafeBitCast(imp, to: Fn.self)(device, sel, ObjCBool(on), 0, AutoreleasingUnsafeMutablePointer($0))
+    }
+    if !ok.boolValue { throw InputError("hwkeyboard: \(err?.localizedDescription ?? "refused")") }
+}
 
 func runInput(device: NSObject, udid: String, size: @escaping () -> (Int, Int)) -> Never {
     // Everything that builds a message runs on the main thread: the mouse
@@ -355,6 +378,18 @@ func runInput(device: NSObject, udid: String, size: @escaping () -> (Int, Int)) 
             // Not on the main thread: the translator blocks on each request
             // it makes, and nothing says it never needs the main thread to
             // finish one.
+            // Neither client carries it: it is a CoreSimulator call on the
+            // device, so it works on either route.
+            if f[0] == "hwkeyboard" {
+                if f.count == 2, f[1] == "on" || f[1] == "off" {
+                    do { try setHardwareKeyboard(device, f[1] == "on"); reply = "ok" } catch { reply = "err \(error)" }
+                } else {
+                    reply = "err hwkeyboard on|off"
+                }
+                print(reply)
+                fflush(stdout)
+                continue
+            }
             if f[0] == "ui" || f[0] == "front" {
                 do { reply = try f[0] == "ui" ? ui() : front() } catch { reply = "err \(error)" }
                 print(reply)
