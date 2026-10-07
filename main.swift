@@ -152,17 +152,21 @@ if descriptors.isEmpty {
 }
 guard !descriptors.isEmpty else { fail("no framebuffer display port") }
 
-// The main display is the largest surface. A phone has one; the others are
-// overlays or external displays.
+// The main display is the lit one where CoreDevice says which that is (see
+// displays.swift), and otherwise the largest surface. A phone has one; the
+// others are overlays or external displays.
 func currentSurface() -> IOSurface? {
     var best: IOSurface?
+    let lit = litSize()
     for d in descriptors {
         guard let s = d.perform(NSSelectorFromString("framebufferSurface"))?.takeUnretainedValue() else { continue }
         let surf = unsafeBitCast(s, to: IOSurface.self)
+        if let lit, surf.width == lit.0, surf.height == lit.1 { return surf }
         if best == nil || surf.width * surf.height > best!.width * best!.height { best = surf }
     }
     return best
 }
+watchLitDisplay(udid: udid)
 
 if inputMode {
     runInput(device: device, udid: udid) {
