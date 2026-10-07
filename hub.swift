@@ -21,6 +21,7 @@
 
 import CoreDevice
 import Foundation
+import IOKit
 
 private let coreDevicePath = "/Library/Developer/PrivateFrameworks/CoreDevice.framework/CoreDevice"
 
@@ -47,11 +48,15 @@ final class HubHID {
     let button: any HIDButton
     let keyboard: any HIDKeyboard
     let digitizer: any HIDDigitizer
+    // Optional: only the hinge uses it, and a device without one should
+    // not lose its buttons over it.
+    let vendor: (any HIDVendorDefined)?
 
-    private init(button: any HIDButton, keyboard: any HIDKeyboard, digitizer: any HIDDigitizer) {
+    private init(button: any HIDButton, keyboard: any HIDKeyboard, digitizer: any HIDDigitizer, vendor: (any HIDVendorDefined)?) {
         self.button = button
         self.keyboard = keyboard
         self.digitizer = digitizer
+        self.vendor = vendor
     }
 
     static var available: Bool { dlopen(coreDevicePath, RTLD_LAZY) != nil }
@@ -78,7 +83,9 @@ final class HubHID {
                     result = .failure(InputError("CoreDevice capabilities are not HIDButton, HIDKeyboard and HIDDigitizer"))
                     return
                 }
-                result = .success(HubHID(button: button, keyboard: keyboard, digitizer: digitizer))
+                let v = try? await implementation(dev, CapabilityStaticMember<HIDDeviceCapability>.vendorDefined)
+                result = .success(HubHID(button: button, keyboard: keyboard, digitizer: digitizer,
+                                         vendor: v as? any HIDVendorDefined))
             } catch {
                 result = .failure(InputError("CoreDevice: \(error)"))
             }
@@ -123,6 +130,72 @@ final class HubHID {
                            eventType: type, edge: .none, target: digitizerTarget())
         digitizer.sendBarrier()
     }
+}
+
+extension HubHID {
+    func hinge(_ degrees: Double) throws {
+        guard let vendor else { throw InputError("CoreDevice has no vendor-defined HID capability here") }
+        try sendHinge(vendor, degrees)
+    }
+}
+
+// sendHinge sets a foldable's hinge angle, 0 closed to 180 flat, the way
+// Device Hub's hinge slider does: a dictionary serialised with IOCFSerialize
+// in its binary form, on vendor page 0xff61 usage 0x5b, version 0. The keys
+// and values are the ones its CoreDevice plugin
+// (CoreDevicePopDeviceKitExtension) builds on Xcode 27.1; they were read out
+// of the binary, not from a header.
+func sendHinge(_ vendor: any HIDVendorDefined, _ degrees: Double) throws {
+    let report: [String: Any] = [
+        "provider": "com.apple.Virtualization.VirtualMachines",
+        "source": "hinge-slider-control",
+        "type": "range",
+        "value": min(max(degrees, 0), 180),
+    ]
+    guard let data = IOCFSerialize(report as CFDictionary, CFOptionFlags(kIOCFSerializeToBinary)) else {
+        throw InputError("IOCFSerialize failed")
+    }
+    try vendor.send(usagePage: 0xff61, usage: 0x5b, version: 0, data: data as Data)
+    vendor.sendBarrier()
+}
+
+// openHinge opens only the vendor-defined capability, for an input process
+// whose CoreDevice open failed and so runs on the legacy client. The hinge
+// has no legacy equivalent, and taking this one capability leaves touch,
+// buttons and keys where they are. The full open missed its five seconds
+// about one time in eight while the Mac's load average read 370, and
+// succeeded in 0.8s on the next try, so this waits longer and is retried on
+// each hinge until it opens.
+final class HubHinge {
+    let vendor: any HIDVendorDefined
+    init(_ vendor: any HIDVendorDefined) { self.vendor = vendor }
+    func set(_ degrees: Double) throws { try sendHinge(vendor, degrees) }
+}
+
+func openHinge(udid: String) -> Result<HubHinge, InputError> {
+    guard HubHID.available else { return .failure(InputError("CoreDevice is not installed")) }
+    guard let want = UUID(uuidString: udid) else { return .failure(InputError("bad udid")) }
+    var result: Result<HubHinge, InputError> = .failure(InputError("CoreDevice: no answer in 10s"))
+    let done = DispatchSemaphore(value: 0)
+    Task.detached {
+        defer { done.signal() }
+        guard let dev = await coreDevice(want) else {
+            result = .failure(InputError("CoreDevice does not list \(udid)"))
+            return
+        }
+        do {
+            let v = try await implementation(dev, CapabilityStaticMember<HIDDeviceCapability>.vendorDefined)
+            guard let vendor = v as? any HIDVendorDefined else {
+                result = .failure(InputError("CoreDevice capability is not HIDVendorDefined"))
+                return
+            }
+            result = .success(HubHinge(vendor))
+        } catch {
+            result = .failure(InputError("CoreDevice: \(error)"))
+        }
+    }
+    _ = done.wait(timeout: .now() + 10)
+    return result
 }
 
 // digitizerTarget aims a touch at the lit panel. mainScreen is the outer

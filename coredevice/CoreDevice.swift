@@ -155,3 +155,17 @@ public struct DisplayInfo {
 extension RemoteDevice {
   public var displayInfo: DisplayInfo { get async throws { fatalError() } }
 }
+
+// Vendor-defined HID reports. Device Hub's hinge slider sends the fold angle
+// this way, page 0xff61 usage 0x5b.
+public protocol HIDVendorDefined: DeviceCapabilityProtocol {
+  func send(usagePage: UInt16, usage: UInt16, version: UInt32, data: Data) throws(CoreDeviceError)
+  func sendBarrier()
+}
+public struct VendorDefinedHIDCapability: DeviceCapability {
+  public typealias ProtocolType = Any
+  public typealias ImplType = Any
+}
+extension CapabilityStaticMember where A == HIDDeviceCapability {
+  public static var vendorDefined: CapabilityStaticMember<VendorDefinedHIDCapability> { fatalError() }
+}
