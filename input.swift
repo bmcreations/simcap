@@ -225,6 +225,10 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
             // The lit panel's screen ID, for simctl's --display, or 0 when
             // CoreDevice has not said which panel is lit.
             return "ok \(litDisplay()?.id ?? 0)"
+        case "panels":
+            return "ok \(panelCount())"
+        case "posture":
+            return "ok \(posture())"
         case "button":
             guard f.count == 2 else { throw InputError("button NAME") }
             switch f[1] {
@@ -283,6 +287,20 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
         return nil
     }
 
+    // A hinge on the legacy route opens the vendor capability by itself,
+    // and keeps trying on later hinges until it does.
+    var hingeOnly: HubHinge?
+    func hingeLegacy(_ f: [Substring]) -> String {
+        guard f.count == 2, let deg = Double(f[1]) else { return "err hinge DEGREES" }
+        if hingeOnly == nil {
+            switch openHinge(udid: udid) {
+            case .success(let v): hingeOnly = v
+            case .failure(let e): return "err hinge needs CoreDevice, which did not open: \(e)"
+            }
+        }
+        do { try hingeOnly!.set(deg); return "ok" } catch { return "err \(error)" }
+    }
+
     // Two-finger gestures exist only on the CoreDevice route: the legacy
     // client's mouse builder takes one point.
     func twoFinger(_ f: [Substring], _ h: HubHID) throws -> Bool {
@@ -303,6 +321,9 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
             let (x0, y0, _, _) = try norm(try num(2), try num(3))
             let (x1, y1, _, _) = try norm(try num(4), try num(5))
             try h.touch2(phase, x0, y0, x1, y1)
+        case "hinge":
+            guard f.count == 2, let deg = Double(f[1]) else { throw InputError("hinge DEGREES") }
+            try h.hinge(deg)
         case "pinch":
             guard f.count == 6 else { throw InputError("pinch X Y FROM TO MS") }
             let (cx, cy, from, to) = (try num(1), try num(2), try num(3) / 2, try num(4) / 2)
@@ -377,12 +398,18 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
                 fflush(stdout)
                 continue
             }
+            if f[0] == "hinge", route() == nil {
+                reply = hingeLegacy(f)
+                print(reply)
+                fflush(stdout)
+                continue
+            }
             if ["touch2", "pinch"].contains(f[0]), route() == nil {
                 print("err \(f[0]) needs CoreDevice, which did not open")
                 fflush(stdout)
                 continue
             }
-            if ["button", "key", "keydown", "keyup", "touch", "tap", "swipe", "touch2", "pinch"].contains(f[0]), let h = route() {
+            if ["button", "key", "keydown", "keyup", "touch", "tap", "swipe", "touch2", "pinch", "hinge"].contains(f[0]), let h = route() {
                 do { try hubHandle(h, f); reply = "ok" } catch { reply = "err \(error)" }
                 print(reply)
                 fflush(stdout)
