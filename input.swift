@@ -149,17 +149,24 @@ private func setHardwareKeyboard(_ device: NSObject, _ on: Bool) throws {
     if !ok.boolValue { throw InputError("hwkeyboard: \(err?.localizedDescription ?? "refused")") }
 }
 
-func runInput(device: NSObject, udid: String, size: @escaping () -> (Int, Int)) -> Never {
+// screen is the lit framebuffer's width and height and its clockwise turn to
+// upright. Coordinates arrive on the upright screen, the space the video,
+// simctl's screenshot and the accessibility tree share.
+func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int, Int)) -> Never {
     // Everything that builds a message runs on the main thread: the mouse
     // builder reads AppKit's per-thread state, and off the main thread the
     // simulator drops what it builds without a word.
     let hid = HID(device: device)
     log("input ready")
 
+    // norm maps an upright point to one normalised to the framebuffer, and
+    // returns the framebuffer's size beside it.
     func norm(_ x: Double, _ y: Double) throws -> (Double, Double, Double, Double) {
-        let (w, h) = size()
+        let (w, h, t) = screen()
         guard w > 0, h > 0 else { throw InputError("no framebuffer") }
-        return (min(max(x / Double(w), 0), 1), min(max(y / Double(h), 0), 1), Double(w), Double(h))
+        let (uw, uh) = turned(w, h, t)
+        let (px, py) = panelNorm(min(max(x / Double(uw), 0), 1), min(max(y / Double(uh), 0), 1), t)
+        return (px, py, Double(w), Double(h))
     }
 
     // Touch, tap and swipe, the same through either client.
@@ -211,8 +218,13 @@ func runInput(device: NSObject, udid: String, size: @escaping () -> (Int, Int)) 
         if try gesture(f, hid.touch) { return "ok" }
         switch f[0] {
         case "size":
-            let (w, h) = size()
-            return "ok \(w) \(h)"
+            let (w, h, t) = screen()
+            let (uw, uh) = turned(w, h, t)
+            return "ok \(uw) \(uh)"
+        case "display":
+            // The lit panel's screen ID, for simctl's --display, or 0 when
+            // CoreDevice has not said which panel is lit.
+            return "ok \(litDisplay()?.id ?? 0)"
         case "button":
             guard f.count == 2 else { throw InputError("button NAME") }
             switch f[1] {

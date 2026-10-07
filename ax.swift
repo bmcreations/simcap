@@ -118,7 +118,19 @@ final class AXTree {
         else { throw InputError("no element for the frontmost application") }
         var all: [Elem] = []
         let tree = read(root, parent: nil, depth: 0, into: &all)
-        markOccluded(all)
+        // The root reports the outer panel's size even while the Duo's inner
+        // panel is lit, 466x678 points against the inner's 951x669 upright.
+        // The frames are already upright -- About in Settings read
+        // (341,304) 525x50 on loupe-duo unfolded, where the screenshot has
+        // it -- so only the root and the occlusion bounds take the lit size.
+        guard let lit = litDisplay(), let spec = panelSpec(lit.id), spec.scale > 0 else {
+            markOccluded(all, screen: all.first?.frame ?? .null)
+            return tree.json
+        }
+        let (uw, uh) = turned(lit.width, lit.height, lit.turn)
+        let screen = CGRect(x: 0, y: 0, width: Double(uw) / spec.scale, height: Double(uh) / spec.scale)
+        markOccluded(all, screen: screen)
+        tree.fields["frame"] = [0, 0, screen.width, screen.height]
         return tree.json
     }
 
@@ -176,12 +188,11 @@ final class AXTree {
     //
     // A hit the dump did not reach is placed by walking up its parents to
     // one that it did. A hit on nothing proves nothing.
-    private func markOccluded(_ all: [Elem]) {
+    private func markOccluded(_ all: [Elem], screen: CGRect) {
         typealias AtFn = @convention(c) (AnyObject, Selector, CGPoint, UInt32, AnyObject) -> Unmanaged<AnyObject>?
         let sel = NSSelectorFromString("objectAtPoint:displayId:bridgeDelegateToken:")
         guard let imp = class_getMethodImplementation(type(of: translator), sel) else { return }
         let at = unsafeBitCast(imp, to: AtFn.self)
-        let screen = all.first?.frame ?? .null
         for el in all.dropFirst() {
             guard let f = el.frame, f.width > 0, f.height > 0 else { continue }
             if !screen.isNull, !screen.contains(CGPoint(x: f.midX, y: f.midY)) {
