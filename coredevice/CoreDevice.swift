@@ -132,3 +132,26 @@ public struct PasteboardCapability: DeviceCapability {
 extension CapabilityStaticMember where A: DeviceCapability {
   public static var pasteboard: CapabilityStaticMember<PasteboardCapability> { fatalError() }
 }
+
+// The device's displays, which say which panel is lit: on the iPhone Duo both
+// framebuffers stay allocated and only one is drawn. Exported by
+// CoreDeviceUtilities under this module's name, like the keyboard types.
+public struct Display {
+  public enum BacklightState {
+    case unknown, off, activeOn, activeDimmed, inactiveOn
+    public var rawValue: String { fatalError() }
+  }
+  public var active: Bool? { fatalError() }
+  public var backlightState: BacklightState { fatalError() }
+  public var external: Bool { fatalError() }
+  public var displayId: UInt32 { fatalError() }
+  public var name: String { fatalError() }
+  public var nativeSize: CGSize { fatalError() }
+  public var chromeIdentifier: String? { fatalError() }
+}
+public struct DisplayInfo {
+  public var displays: [Display] { fatalError() }
+}
+extension RemoteDevice {
+  public var displayInfo: DisplayInfo { get async throws { fatalError() } }
+}
