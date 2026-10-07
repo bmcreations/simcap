@@ -64,7 +64,7 @@ func fail(_ msg: String) -> Never {
     FileHandle.standardError.write("simcap: \(msg)\n".data(using: .utf8)!)
     exit(1)
 }
-func log(_ msg: String) {
+@Sendable func log(_ msg: String) {
     FileHandle.standardError.write("simcap: \(msg)\n".data(using: .utf8)!)
 }
 
