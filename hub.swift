@@ -107,7 +107,7 @@ final class HubHID {
         case .move: .position
         case .up: .end
         }
-        try digitizer.send(pointOne: DigitizerPoint(x: x, y: y), pointTwo: nil, eventType: type, edge: .none, target: .mainScreen)
+        try digitizer.send(pointOne: DigitizerPoint(x: x, y: y), pointTwo: nil, eventType: type, edge: .none, target: digitizerTarget())
         digitizer.sendBarrier()
     }
 
@@ -120,7 +120,17 @@ final class HubHID {
         case .up: .end
         }
         try digitizer.send(pointOne: DigitizerPoint(x: x0, y: y0), pointTwo: DigitizerPoint(x: x1, y: y1),
-                           eventType: type, edge: .none, target: .mainScreen)
+                           eventType: type, edge: .none, target: digitizerTarget())
         digitizer.sendBarrier()
     }
+}
+
+// digitizerTarget aims a touch at the lit panel. mainScreen is the outer
+// panel on an iPhone Duo, so an unfolded Duo took every touch and did
+// nothing with it.
+func digitizerTarget() -> DigitizerTarget {
+    let all: [DigitizerTarget] = [.display1, .display2, .display3, .display4, .display5,
+                                  .display6, .display7, .display8, .display9, .display10]
+    guard let id = litDisplay()?.id, id >= 1, Int(id) <= all.count else { return .mainScreen }
+    return all[Int(id) - 1]
 }

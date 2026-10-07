@@ -154,24 +154,26 @@ guard !descriptors.isEmpty else { fail("no framebuffer display port") }
 
 // The main display is the lit one where CoreDevice says which that is (see
 // displays.swift), and otherwise the largest surface. A phone has one; the
-// others are overlays or external displays.
-func currentSurface() -> IOSurface? {
+// others are overlays or external displays. turn is how far the surface is
+// turned clockwise to stand upright, which only the lit panel can know.
+func currentSurface() -> (surf: IOSurface, turn: Int)? {
     var best: IOSurface?
-    let lit = litSize()
+    let lit = litDisplay()
     for d in descriptors {
         guard let s = d.perform(NSSelectorFromString("framebufferSurface"))?.takeUnretainedValue() else { continue }
         let surf = unsafeBitCast(s, to: IOSurface.self)
-        if let lit, surf.width == lit.0, surf.height == lit.1 { return surf }
+        if let lit, surf.width == lit.width, surf.height == lit.height { return (surf, lit.turn) }
         if best == nil || surf.width * surf.height > best!.width * best!.height { best = surf }
     }
-    return best
+    return best.map { ($0, 0) }
 }
+loadPanelSpecs(device: device)
 watchLitDisplay(udid: udid)
 
 if inputMode {
     runInput(device: device, udid: udid) {
-        guard let s = currentSurface() else { return (0, 0) }
-        return (s.width, s.height)
+        guard let s = currentSurface() else { return (0, 0, 0) }
+        return (s.surf.width, s.surf.height, s.turn)
     }
 }
 
@@ -202,9 +204,12 @@ func packet(pts: UInt64, flags: UInt64, _ payload: Data) {
 let startCode = Data([0, 0, 0, 1])
 var session: VTCompressionSession?
 var width = 0, height = 0          // the framebuffer's
+var turn = 0                       // clockwise degrees to stand it upright
 var outWidth = 0, outHeight = 0    // the encoded picture's
 var scaler: VTPixelTransferSession?
 var scaledPool: CVPixelBufferPool?
+var rotator: VTPixelRotationSession?
+var rotatedPool: CVPixelBufferPool?
 var lastParams = Data()
 var forceKey = true
 let encodeQueue = DispatchQueue(label: "simcap.encode", qos: .userInteractive)
@@ -281,36 +286,63 @@ func makeSession(_ w: Int, _ h: Int) {
 // with both sides a multiple of 8 as scrcpy's own encoder rounds them.
 func scaledSize(_ w: Int, _ h: Int) -> (Int, Int) {
     let long = max(w, h)
-    guard maxSize > 0, long > maxSize else { return (w, h) }
+    // The encoder crops an odd side to even, which left the SPS a pixel
+    // short of the header on the Duo's 2853x2007 inner panel.
+    guard maxSize > 0, long > maxSize else { return (w & ~1, h & ~1) }
     let f = Double(maxSize) / Double(long)
     func r8(_ v: Int) -> Int { max(8, Int((Double(v) * f / 8).rounded()) * 8) }
     return (r8(w), r8(h))
 }
 
-// makeScaler prepares the downscale for a framebuffer of w x h, or clears it
-// when the picture is encoded at its own size.
-func makeScaler(_ w: Int, _ h: Int) {
+// makePool makes a pool of w x h NV12 buffers backed by IOSurfaces.
+func makePool(_ w: Int, _ h: Int) -> CVPixelBufferPool {
+    let attrs: [CFString: Any] = [
+        kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        kCVPixelBufferWidthKey: w,
+        kCVPixelBufferHeightKey: h,
+        kCVPixelBufferIOSurfacePropertiesKey: [:] as [CFString: Any],
+    ]
+    var pool: CVPixelBufferPool?
+    guard CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool) == kCVReturnSuccess, let pool else {
+        fail("CVPixelBufferPoolCreate \(w)x\(h)")
+    }
+    return pool
+}
+
+// makeScaler prepares the turn and the downscale for a framebuffer of w x h,
+// or clears them when the picture is encoded at its own size and upright.
+// The turn is a VTPixelRotationSession into an upright buffer, since the
+// transfer session only scales; the scale then runs on the upright picture.
+func makeScaler(_ w: Int, _ h: Int, _ t: Int) {
     if let s = scaler { VTPixelTransferSessionInvalidate(s) }
+    if let r = rotator { VTPixelRotationSessionInvalidate(r) }
     scaler = nil
     scaledPool = nil
-    guard (outWidth, outHeight) != (w, h) else { return }
+    rotator = nil
+    rotatedPool = nil
+    let (uw, uh) = turned(w, h, t)
+    if t != 0 {
+        var r: VTPixelRotationSession?
+        guard VTPixelRotationSessionCreate(nil, &r) == noErr, let r else {
+            fail("VTPixelRotationSessionCreate")
+        }
+        let rotation: CFString = switch t {
+        case 90: kVTRotation_CW90
+        case 180: kVTRotation_180
+        default: kVTRotation_CCW90
+        }
+        VTSessionSetProperty(r, key: kVTPixelRotationPropertyKey_Rotation, value: rotation)
+        rotator = r
+        rotatedPool = makePool(uw, uh)
+    }
+    guard (outWidth, outHeight) != (uw, uh) else { return }
     var s: VTPixelTransferSession?
     guard VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &s) == noErr, let s else {
         fail("VTPixelTransferSessionCreate")
     }
     VTSessionSetProperty(s, key: kVTPixelTransferPropertyKey_ScalingMode, value: kVTScalingMode_Normal)
-    let attrs: [CFString: Any] = [
-        kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-        kCVPixelBufferWidthKey: outWidth,
-        kCVPixelBufferHeightKey: outHeight,
-        kCVPixelBufferIOSurfacePropertiesKey: [:] as [CFString: Any],
-    ]
-    var pool: CVPixelBufferPool?
-    guard CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool) == kCVReturnSuccess, let pool else {
-        fail("CVPixelBufferPoolCreate \(outWidth)x\(outHeight)")
-    }
     scaler = s
-    scaledPool = pool
+    scaledPool = makePool(outWidth, outHeight)
 }
 
 // The stream header needs dimensions, so it goes out with the first surface.
@@ -327,28 +359,37 @@ var lastEncode: UInt64 = 0
 // that landed a little early wait for the next one: 60fps in, 50 out.
 let minGap = UInt64(1_000_000_000 / max(1, maxFPS)) * 3 / 4
 
-func encode(_ surf: IOSurface) {
+func encode(_ surf: IOSurface, _ t: Int) {
     let w = surf.width, h = surf.height
+    let (uw, uh) = turned(w, h, t)
     if session == nil {
-        width = w; height = h
-        (outWidth, outHeight) = scaledSize(w, h)
+        width = w; height = h; turn = t
+        (outWidth, outHeight) = scaledSize(uw, uh)
         writeHeader(outWidth, outHeight)
-        makeScaler(w, h)
+        makeScaler(w, h, t)
         makeSession(outWidth, outHeight)
-        log("\(deviceName) \(w)x\(h) as \(outWidth)x\(outHeight) \(bitRate)bps \(maxFPS)fps")
-    } else if w != width || h != height {
-        // Rotation or a resize. The wire has no way to re-announce size
-        // mid-stream except through the SPS, which the config packet carries.
+        log("\(deviceName) \(w)x\(h) turned \(t) as \(outWidth)x\(outHeight) \(bitRate)bps \(maxFPS)fps")
+    } else if w != width || h != height || t != turn {
+        // Rotation, a resize, or a fold onto another panel. The wire has no
+        // way to re-announce size mid-stream except through the SPS, which
+        // the config packet carries.
         VTCompressionSessionInvalidate(session!)
-        width = w; height = h
-        (outWidth, outHeight) = scaledSize(w, h)
-        makeScaler(w, h)
+        width = w; height = h; turn = t
+        (outWidth, outHeight) = scaledSize(uw, uh)
+        makeScaler(w, h, t)
         makeSession(outWidth, outHeight)
         forceKey = true
+        log("now \(w)x\(h) turned \(t) as \(outWidth)x\(outHeight)")
     }
     var pb: Unmanaged<CVPixelBuffer>?
     guard CVPixelBufferCreateWithIOSurface(nil, surf, nil, &pb) == kCVReturnSuccess, var pixels = pb?.takeRetainedValue() else {
         return
+    }
+    if let rotator, let rotatedPool {
+        var out: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, rotatedPool, &out) == kCVReturnSuccess, let out,
+              VTPixelRotationSessionRotateImage(rotator, pixels, out) == noErr else { return }
+        pixels = out
     }
     if let scaler, let scaledPool {
         var out: CVPixelBuffer?
@@ -379,7 +420,7 @@ func schedule() {
         let wait = lastEncode + minGap > now ? lastEncode + minGap - now : 0
         encodeQueue.asyncAfter(deadline: .now() + .nanoseconds(Int(wait))) {
             pending = false
-            autoreleasepool { if let s = currentSurface() { encode(s) } }
+            autoreleasepool { if let s = currentSurface() { encode(s.surf, s.turn) } }
         }
     }
 }
