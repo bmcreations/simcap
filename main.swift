@@ -10,6 +10,7 @@
 //   simcap -devices            list physical iPhones and their HID capabilities; see devices.swift
 //   simcap <udid> -phone [name] stream a physical iPhone on a cable instead; see phone.swift
 //   simcap <identifier> -phone-input  a physical iPhone's input; see phoneinput.swift
+//   simcap <identifier> -phone-wifi [name]  stream a physical iPhone over Wi-Fi; see wifi.swift
 //
 // The framebuffer is reached through CoreSimulator and SimulatorKit, which are
 // private and move with Xcode, so this is built on its own rather than by
@@ -42,7 +43,7 @@ func flag(_ name: String, _ def: Int) -> Int {
 // -caps lets the server tell a build with input from an older one, which
 // would read -input as nothing and start streaming video into the reply pipe.
 if args == ["-caps"] {
-    print("video\ninput\nui\nroute\nbitrate\npasteboard\ndevices\nphone\nphoneinput")
+    print("video\ninput\nui\nroute\nbitrate\npasteboard\ndevices\nphone\nphoneinput\nphonewifi")
     exit(0)
 }
 // Before CoreSimulator is loaded: a physical device needs none of it.
@@ -81,6 +82,9 @@ func fail(_ msg: String) -> Never {
 // Before CoreSimulator is loaded, and after the flags the encoder reads.
 if args.count >= 2, args[1] == "-phone" {
     runPhone(udid: args[0], name: args.count > 2 ? args[2] : "")
+}
+if args.count >= 2, args[1] == "-phone-wifi" {
+    runPhoneWifi(identifier: args[0], name: args.count > 2 ? args[2] : "")
 }
 
 // MARK: - private frameworks
