@@ -72,7 +72,8 @@ private func devicectlDevices() -> [String: [String: Any]] {
     var byID: [String: [String: Any]] = [:]
     for d in list {
         guard let id = d["identifier"] as? String else { continue }
-        let hw = d["hardwareProperties"] as? [String: Any] ?? [:]
+        let hw = (d["hardwareProperties"] as? [String: Any] ?? [:])
+            .merging((d["properties"] as? [String: Any])?["hardware"] as? [String: Any] ?? [:]) { _, b in b }
         if let reality = hw["reality"] as? String, reality != "physical" { continue }
         byID[id.uppercased()] = d
     }
@@ -83,9 +84,17 @@ private func devicectlDevices() -> [String: [String: Any]] {
 // how it is reached. transport is "wired" over a cable and "localNetwork"
 // over Wi-Fi; tunnel is whether a developer tunnel is up.
 private func summary(_ d: [String: Any]) -> [String: Any] {
-    let dev = d["deviceProperties"] as? [String: Any] ?? [:]
-    let hw = d["hardwareProperties"] as? [String: Any] ?? [:]
-    let conn = d["connectionProperties"] as? [String: Any] ?? [:]
+    // Xcode 27's devicectl moved these under `properties` and still writes
+    // the old keys; the new one wins where both have a value.
+    let props = d["properties"] as? [String: Any] ?? [:]
+    func merged(_ old: String, _ new: String) -> [String: Any] {
+        let o = d[old] as? [String: Any] ?? [:]
+        let n = props[new] as? [String: Any] ?? [:]
+        return o.merging(n) { _, b in b }
+    }
+    let dev = merged("deviceProperties", "device").merging(props["state"] as? [String: Any] ?? [:]) { a, _ in a }
+    let hw = merged("hardwareProperties", "hardware")
+    let conn = merged("connectionProperties", "connection")
     var s: [String: Any] = [:]
     s["name"] = dev["name"]
     s["os"] = dev["osVersionNumber"]
@@ -96,6 +105,7 @@ private func summary(_ d: [String: Any]) -> [String: Any] {
     s["transport"] = conn["transportType"]
     s["pairing"] = conn["pairingState"]
     s["tunnel"] = conn["tunnelState"]
+    s["connection"] = conn["state"]
     return s
 }
 
