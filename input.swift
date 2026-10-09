@@ -126,7 +126,7 @@ struct InputError: Error, CustomStringConvertible {
     init(_ s: String) { description = s }
 }
 
-private let leftShift: UInt32 = 225
+let leftShift: UInt32 = 225
 
 // setHardwareKeyboard is Simulator.app's "Connect Hardware Keyboard". With it
 // on, iOS stops raising its own keyboard for a focused field and takes typing
