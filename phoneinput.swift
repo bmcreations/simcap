@@ -274,10 +274,34 @@ func runPhoneInput(identifier: String) -> Never {
     // HubHID.open blocks the calling thread and must not be on the main
     // one, so the loop runs on its own; CoreDevice's sends are XPC and need
     // no main thread.
+    //
+    // SIGTERM and SIGINT end the process between commands. During one they
+    // only set exitRequested, and the loop exits after the reply is written,
+    // so a swipe's touch-up is sent by the code that sent its touch-down:
+    // lifting from the handler would put a second writer on the HubHID. A
+    // SIGKILL cannot be caught and can still leave a finger down.
+    let state = NSLock()
+    var busy = false
+    var exitRequested = false
+    var sources: [DispatchSourceSignal] = []
+    for s in [SIGTERM, SIGINT] {
+        signal(s, SIG_IGN)
+        let src = DispatchSource.makeSignalSource(signal: s, queue: .global())
+        src.setEventHandler {
+            state.lock()
+            if busy { exitRequested = true; state.unlock() } else { exit(0) }
+        }
+        src.resume()
+        sources.append(src)
+    }
+
     Thread.detachNewThread {
         while let line = readLine() {
             let f = line.split(separator: " ")
             guard !f.isEmpty else { continue }
+            state.lock()
+            busy = true
+            state.unlock()
             var reply: String
             do { reply = try handle(f) } catch {
                 if error is Unreachable {
@@ -289,6 +313,10 @@ func runPhoneInput(identifier: String) -> Never {
                 }
             }
             writeReply(reply)
+            state.lock()
+            busy = false
+            if exitRequested { exit(0) }
+            state.unlock()
         }
         exit(0)
     }
