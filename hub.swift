@@ -51,8 +51,11 @@ final class HubHID {
     // Optional: only the hinge uses it, and a device without one should
     // not lose its buttons over it.
     let vendor: (any HIDVendorDefined)?
+    // Kept so a capability can be asked for again after a send; see validate.
+    let device: RemoteDevice
 
-    private init(button: any HIDButton, keyboard: any HIDKeyboard, digitizer: any HIDDigitizer, vendor: (any HIDVendorDefined)?) {
+    private init(device: RemoteDevice, button: any HIDButton, keyboard: any HIDKeyboard, digitizer: any HIDDigitizer, vendor: (any HIDVendorDefined)?) {
+        self.device = device
         self.button = button
         self.keyboard = keyboard
         self.digitizer = digitizer
@@ -84,7 +87,7 @@ final class HubHID {
                     return
                 }
                 let v = try? await implementation(dev, CapabilityStaticMember<HIDDeviceCapability>.vendorDefined)
-                result = .success(HubHID(button: button, keyboard: keyboard, digitizer: digitizer,
+                result = .success(HubHID(device: dev, button: button, keyboard: keyboard, digitizer: digitizer,
                                          vendor: v as? any HIDVendorDefined))
             } catch {
                 result = .failure(InputError("CoreDevice: \(error)"))
@@ -92,6 +95,37 @@ final class HubHID {
         }
         _ = done.wait(timeout: .now() + 5)
         return result
+    }
+
+    enum Kind { case button, keyboard, digitizer }
+
+    // validate asks CoreDevice for the capability again and throws if it
+    // cannot be had. CoreDevice gives no delivery signal: sendBarrier() is
+    // `() -> ()` on all three HID protocols, with no throw and no completion,
+    // and a send on a capability whose tunnel has dropped was seen to return
+    // without throwing. So this is the only evidence available after a send,
+    // and `ok` after it means "sent, and the capability still answered", not
+    // "the phone received it". A report dropped while the capability still
+    // answers is not caught. Blocks the calling thread for up to `seconds`.
+    func validate(_ kind: Kind, within seconds: Double = 3) throws {
+        var failure: InputError? = InputError("CoreDevice: capability did not answer in \(Int(seconds))s")
+        let done = DispatchSemaphore(value: 0)
+        let dev = device
+        Task.detached {
+            defer { done.signal() }
+            do {
+                switch kind {
+                case .button: _ = try await implementation(dev, CapabilityStaticMember<HIDDeviceCapability>.button)
+                case .keyboard: _ = try await implementation(dev, CapabilityStaticMember<HIDDeviceCapability>.keyboard)
+                case .digitizer: _ = try await implementation(dev, CapabilityStaticMember<HIDDeviceCapability>.digitizer)
+                }
+                failure = nil
+            } catch {
+                failure = InputError("CoreDevice: \(error)")
+            }
+        }
+        _ = done.wait(timeout: .now() + seconds)
+        if let failure { throw failure }
     }
 
     // Consumer page: 0x40 Menu is Home and 0x30 Power is lock, both run.

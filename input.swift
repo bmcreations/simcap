@@ -394,25 +394,21 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
                 } else if case .failure(let e) = hub! {
                     reply = "ok legacy \(e)"
                 }
-                print(reply)
-                fflush(stdout)
+                writeReply(reply)
                 continue
             }
             if f[0] == "hinge", route() == nil {
                 reply = hingeLegacy(f)
-                print(reply)
-                fflush(stdout)
+                writeReply(reply)
                 continue
             }
             if ["touch2", "pinch"].contains(f[0]), route() == nil {
-                print("err \(f[0]) needs CoreDevice, which did not open")
-                fflush(stdout)
+                writeReply("err \(f[0]) needs CoreDevice, which did not open")
                 continue
             }
             if ["button", "key", "keydown", "keyup", "touch", "tap", "swipe", "touch2", "pinch", "hinge"].contains(f[0]), let h = route() {
                 do { try hubHandle(h, f); reply = "ok" } catch { reply = "err \(error)" }
-                print(reply)
-                fflush(stdout)
+                writeReply(reply)
                 continue
             }
             // Not on the main thread: the translator blocks on each request
@@ -426,8 +422,7 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
                 } else {
                     reply = "err hwkeyboard on|off"
                 }
-                print(reply)
-                fflush(stdout)
+                writeReply(reply)
                 continue
             }
             // The pasteboard is CoreDevice's too, opened on first use.
@@ -454,23 +449,30 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
                     if case .failure = pasteboard { pasteboard = nil }
                     reply = "err \(error)"
                 }
-                print(reply)
-                fflush(stdout)
+                writeReply(reply)
                 continue
             }
             if f[0] == "ui" || f[0] == "front" {
                 do { reply = try f[0] == "ui" ? ui() : front() } catch { reply = "err \(error)" }
-                print(reply)
-                fflush(stdout)
+                writeReply(reply)
                 continue
             }
             DispatchQueue.main.sync {
                 do { reply = try handle(f) } catch { reply = "err \(error)" }
             }
-            print(reply)
-            fflush(stdout)
+            writeReply(reply)
         }
         exit(0)
     }
     dispatchMain()
+}
+
+// writeReply is the one place a reply goes out on the input line protocol.
+// The reader takes one line per reply, and CoreDevice's error text can run
+// over several lines, which would put the extra lines in front of the next
+// command's reply. CR, LF and CRLF (one Character in Swift) become spaces.
+func writeReply(_ reply: String) {
+    let line = reply.map { $0.isNewline ? " " : String($0) }.joined()
+    print(line)
+    fflush(stdout)
 }
