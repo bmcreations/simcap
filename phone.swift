@@ -22,7 +22,18 @@ import Foundation
 // what Terminal-launched tools use to the same end.
 func disclaimResponsibility() {
     let marker = "SIMCAP_DISCLAIMED"
-    if ProcessInfo.processInfo.environment[marker] != nil { return }
+    if ProcessInfo.processInfo.environment[marker] != nil {
+        // The re-spawned child. A SIGKILL to the parent cannot be passed on,
+        // and the child was left running under launchd, holding the phone's
+        // capture device, so it ends when the parent does.
+        let parent = getppid()
+        let src = DispatchSource.makeProcessSource(identifier: parent, eventMask: .exit, queue: .global())
+        src.setEventHandler { log("phone: parent \(parent) exited"); exit(1) }
+        src.resume()
+        disclaimSignals.append(src)
+        if parent == 1 { exit(1) }
+        return
+    }
     typealias Disclaim = @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>, Int32) -> Int32
     guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "responsibility_spawnattrs_setdisclaim") else {
         log("phone: cannot disclaim responsibility; the camera grant falls to whoever launched simcap")
@@ -49,7 +60,7 @@ func disclaimResponsibility() {
     while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
     exit((status & 0x7f) == 0 ? (status >> 8) & 0xff : 128 + (status & 0x7f))
 }
-var disclaimSignals: [DispatchSourceSignal] = []
+var disclaimSignals: [DispatchSourceProtocol] = []
 
 func allowScreenCaptureDevices() {
     var addr = CMIOObjectPropertyAddress(
@@ -99,6 +110,8 @@ final class PhoneFrames: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
 }
 
 let phoneFrames = PhoneFrames()
+// Under simcapStartBudget, which is 10s.
+let cameraPromptWait: TimeInterval = 8
 let phoneSession = AVCaptureSession()
 
 func runPhone(udid: String, name: String) -> Never {
@@ -107,15 +120,25 @@ func runPhone(udid: String, name: String) -> Never {
     // A screen-capture device is a camera to TCC. Not determined, the session
     // runs and delivers nothing, so ask, which prompts on the Mac once for
     // whichever app is responsible for this process.
+    //
+    // The answer can take as long as nobody is at the Mac, and the server
+    // gives an open 10s (simcapStartBudget), so say so at once and give up
+    // before that, so the reason reaches the viewer rather than a silent
+    // timeout. An ad hoc simcap meets this after every rebuild: TCC matches
+    // the grant by cdhash (see sign.sh).
+    let cameraHelp = "allow simcap's camera prompt on this Mac, or turn simcap on in System Settings > Privacy & Security > Camera"
     if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
+        log("phone: waiting for camera access: \(cameraHelp)")
         let asked = DispatchSemaphore(value: 0)
         AVCaptureDevice.requestAccess(for: .video) { _ in asked.signal() }
+        let deadline = Date().addingTimeInterval(cameraPromptWait)
         while asked.wait(timeout: .now()) == .timedOut {
+            if Date() > deadline { fail("phone: no answer to the camera prompt in \(Int(cameraPromptWait))s: \(cameraHelp)") }
             RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         }
     }
     let auth = AVCaptureDevice.authorizationStatus(for: .video)
-    if auth != .authorized { log("phone: camera authorization is \(auth.rawValue), so no frames will arrive") }
+    if auth != .authorized { fail("phone: camera access is \(auth == .denied ? "denied" : "restricted"), so no frames would arrive: \(cameraHelp)") }
     NotificationCenter.default.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: nil, queue: nil) { n in
         log("phone: capture error: \(String(describing: n.userInfo?[AVCaptureSessionErrorKey]))")
     }
