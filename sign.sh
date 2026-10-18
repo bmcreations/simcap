@@ -5,7 +5,10 @@
 # Ad hoc, simcap's designated requirement is its cdhash, so every rebuild is
 # a new program to TCC: the phone's camera grant no longer matches, and
 # -phone waits on a prompt on the Mac. Signed by a team, the requirement is
-# the identifier and the team, which a rebuild keeps.
+# the identifier and the team, which a rebuild keeps. It is written out here
+# because codesign's default pins the leaf certificate's common name, which
+# carries the person's name and certificate id, so a renewed or reissued
+# certificate would ask for the camera again.
 set -eu
 team=$1 bin=$2
 valid=$(security find-identity -v -p codesigning | awk '{print $2}')
@@ -24,5 +27,7 @@ if [ -z "$sha" ]; then
 	echo "sign.sh: no valid Apple Development identity for team $team" >&2
 	exit 2
 fi
-codesign --force --sign "$sha" --identifier dev.bmcreations.loupe.simcap "$bin"
+id=dev.bmcreations.loupe.simcap
+req="designated => identifier \"$id\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.1] exists and certificate leaf[subject.OU] = \"$team\""
+codesign --force --sign "$sha" --identifier "$id" -r="$req" "$bin"
 codesign -dr - "$bin" 2>&1 | grep designated
