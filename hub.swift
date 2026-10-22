@@ -45,8 +45,10 @@ func coreDevice(_ want: UUID) async -> RemoteDevice? {
 }
 
 final class HubHID {
-    let button: any HIDButton
-    let keyboard: any HIDKeyboard
+    // Optional: a wired iPhone was seen to refuse `hid.button` while its
+    // digitizer answered, and taps should not fail over a button.
+    let button: (any HIDButton)?
+    let keyboard: (any HIDKeyboard)?
     let digitizer: any HIDDigitizer
     // Optional: only the hinge uses it, and a device without one should
     // not lose its buttons over it.
@@ -54,7 +56,7 @@ final class HubHID {
     // Kept so a capability can be asked for again after a send; see validate.
     let device: RemoteDevice
 
-    private init(device: RemoteDevice, button: any HIDButton, keyboard: any HIDKeyboard, digitizer: any HIDDigitizer, vendor: (any HIDVendorDefined)?) {
+    private init(device: RemoteDevice, button: (any HIDButton)?, keyboard: (any HIDKeyboard)?, digitizer: any HIDDigitizer, vendor: (any HIDVendorDefined)?) {
         self.device = device
         self.button = button
         self.keyboard = keyboard
@@ -78,16 +80,15 @@ final class HubHID {
                 return
             }
             do {
-                let b = try await implementation(dev, CapabilityStaticMember<HIDDeviceCapability>.button)
-                let k = try await implementation(dev, CapabilityStaticMember<HIDDeviceCapability>.keyboard)
                 let t = try await implementation(dev, CapabilityStaticMember<HIDDeviceCapability>.digitizer)
-                guard let button = b as? any HIDButton, let keyboard = k as? any HIDKeyboard,
-                      let digitizer = t as? any HIDDigitizer else {
-                    result = .failure(InputError("CoreDevice capabilities are not HIDButton, HIDKeyboard and HIDDigitizer"))
+                guard let digitizer = t as? any HIDDigitizer else {
+                    result = .failure(InputError("CoreDevice capability is not HIDDigitizer"))
                     return
                 }
+                let b = try? await implementation(dev, CapabilityStaticMember<HIDDeviceCapability>.button)
+                let k = try? await implementation(dev, CapabilityStaticMember<HIDDeviceCapability>.keyboard)
                 let v = try? await implementation(dev, CapabilityStaticMember<HIDDeviceCapability>.vendorDefined)
-                result = .success(HubHID(device: dev, button: button, keyboard: keyboard, digitizer: digitizer,
+                result = .success(HubHID(device: dev, button: b as? any HIDButton, keyboard: k as? any HIDKeyboard, digitizer: digitizer,
                                          vendor: v as? any HIDVendorDefined))
             } catch {
                 result = .failure(InputError("CoreDevice: \(error)"))
@@ -130,6 +131,7 @@ final class HubHID {
 
     // Consumer page: 0x40 Menu is Home and 0x30 Power is lock, both run.
     func press(consumer code: Int) throws {
+        guard let button else { throw InputError("CoreDevice: this device has no hid.button") }
         try button.sendCustomButton(usagePage: 0x0C, usageCode: code, state: .down)
         usleep(80_000)
         try button.sendCustomButton(usagePage: 0x0C, usageCode: code, state: .up)
@@ -137,6 +139,7 @@ final class HubHID {
     }
 
     func key(_ usage: UInt32, down: Bool) throws {
+        guard let keyboard else { throw InputError("CoreDevice: this device has no hid.keyboard") }
         try keyboard.send(key: HIDKeyboardUsageCode(rawValue: UInt16(usage)), state: down ? .down : .up)
         keyboard.sendBarrier()
     }
