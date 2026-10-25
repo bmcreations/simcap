@@ -261,6 +261,11 @@ func setBitRate(_ bps: Int) {
     log("bitrate \(bps)bps\(st == noErr ? "" : " failed: \(st)")")
 }
 
+// onKeyRequest runs on encodeQueue after a keyframe is asked for. The
+// simulator sets it to capture at once: a static screen composites nothing,
+// and the keyframe waited up to 250ms for the idle floor.
+var onKeyRequest: () -> Void = {}
+
 // startControl reads stdin: EOF means stop; byte 17 asks for a keyframe; 0x80
 // and a u32 sets the bitrate. Parsed as a stream rather than scanned for 17,
 // because the u32 can contain one.
@@ -276,7 +281,7 @@ func startControl() {
             while let op = q.first {
                 if op == 17 {
                     q.removeFirst()
-                    encodeQueue.async { forceKey = true }
+                    encodeQueue.async { forceKey = true; onKeyRequest() }
                 } else if op == 0x80 {
                     guard q.count >= 5 else { break }
                     let bps = q[1...4].reduce(0) { $0 << 8 | Int($1) }
