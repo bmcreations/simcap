@@ -66,8 +66,11 @@ let maxFPS = flag("-fps", 60)
 // framebuffer is 1206x2622 on an iPhone 17, six times the pixels of a phone
 // capped at 1080, and at that size a keyframe took 176ms to write to a viewer.
 let maxSize = flag("-maxsize", 0)
+// Seconds between keyframes. A viewer that sheds a frame asks for one, so this
+// only bounds the wait when nobody asks.
+let keyframeSecs = max(1, flag("-keyint", 1))
 guard let udid = args.first else {
-    FileHandle.standardError.write("usage: simcap <udid> [-bitrate bps] [-fps n] [-maxsize px] [-input]\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: simcap <udid> [-bitrate bps] [-fps n] [-maxsize px] [-keyint s] [-input]\n".data(using: .utf8)!)
     exit(2)
 }
 
@@ -228,7 +231,7 @@ for d in descriptors where d.responds(to: register) {
 
 // The idle floor: a static screen composites nothing, so re-encode what is
 // there every 250ms. That is what gets a frame out at startup and keeps the
-// one-second keyframe interval honest on a screen nobody is touching.
+// keyframe interval honest on a screen nobody is touching.
 let idle = DispatchSource.makeTimerSource(queue: encodeQueue)
 idle.schedule(deadline: .now(), repeating: .milliseconds(250))
 idle.setEventHandler {
