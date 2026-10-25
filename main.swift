@@ -239,6 +239,7 @@ idle.setEventHandler {
 }
 idle.resume()
 
+onKeyRequest = schedule
 startControl()
 
 dispatchMain()
