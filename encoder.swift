@@ -108,7 +108,7 @@ func makeSession(_ w: Int, _ h: Int) {
         kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_H264_High_AutoLevel,
         kVTCompressionPropertyKey_AverageBitRate: bitRate,
         kVTCompressionPropertyKey_ExpectedFrameRate: maxFPS,
-        kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 1.0,
+        kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: Double(keyframeSecs),
     ]
     for (k, v) in props { VTSessionSetProperty(s, key: k, value: v as CFTypeRef) }
     VTCompressionSessionPrepareToEncodeFrames(s)
