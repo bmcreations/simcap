@@ -23,7 +23,8 @@
 // how the parent says it is done. A byte of 17 on stdin, scrcpy's
 // TYPE_RESET_VIDEO, forces the next frame to be a keyframe. A byte of 0x80
 // followed by a big-endian u32 sets the average bitrate on the running
-// encoder, which scrcpy has no way to do.
+// encoder, which scrcpy has no way to do. A byte of 0x81 followed by a
+// big-endian u16 sets the longest edge, 0 for the -maxsize flag's.
 
 import CoreMedia
 import CoreVideo
@@ -43,7 +44,7 @@ func flag(_ name: String, _ def: Int) -> Int {
 // -caps lets the server tell a build with input from an older one, which
 // would read -input as nothing and start streaming video into the reply pipe.
 if args == ["-caps"] {
-    print("video\ninput\nui\nroute\nbitrate\npasteboard\ndevices\nphone\nphoneinput\nphonewifi")
+    print("video\ninput\nui\nroute\nbitrate\nresize\npasteboard\ndevices\nphone\nphoneinput\nphonewifi")
     exit(0)
 }
 // Before CoreSimulator is loaded: a physical device needs none of it.
@@ -65,7 +66,10 @@ let maxFPS = flag("-fps", 60)
 // Longest edge of the encoded picture, 0 for the framebuffer's own size. The
 // framebuffer is 1206x2622 on an iPhone 17, six times the pixels of a phone
 // capped at 1080, and at that size a keyframe took 176ms to write to a viewer.
-let maxSize = flag("-maxsize", 0)
+let flagMaxSize = flag("-maxsize", 0)
+// A var because stdin can lower it on a slow link (0x81); a rebuild for a new
+// shape keeps the size last set, as bitRate does.
+var maxSize = flagMaxSize
 // Seconds between keyframes. A viewer that sheds a frame asks for one, so this
 // only bounds the wait when nobody asks.
 let keyframeSecs = max(1, flag("-keyint", 1))
