@@ -216,12 +216,7 @@ func encodePixels(_ captured: CVPixelBuffer, _ t: Int) {
         // Rotation, a resize, or a fold onto another panel. The wire has no
         // way to re-announce size mid-stream except through the SPS, which
         // the config packet carries.
-        VTCompressionSessionInvalidate(session!)
-        width = w; height = h; turn = t
-        (outWidth, outHeight) = scaledSize(uw, uh)
-        makeScaler(w, h, t)
-        makeSession(outWidth, outHeight)
-        forceKey = true
+        rebuild(w, h, t)
         log("now \(w)x\(h) turned \(t) as \(outWidth)x\(outHeight)")
     }
     var pixels = captured
@@ -261,13 +256,40 @@ func setBitRate(_ bps: Int) {
     log("bitrate \(bps)bps\(st == noErr ? "" : " failed: \(st)")")
 }
 
+// rebuild starts a new encoder session for a w x h framebuffer turned t, whose
+// first frame is a keyframe carrying the new SPS. Runs on encodeQueue.
+func rebuild(_ w: Int, _ h: Int, _ t: Int) {
+    VTCompressionSessionInvalidate(session!)
+    width = w; height = h; turn = t
+    let (uw, uh) = turned(w, h, t)
+    (outWidth, outHeight) = scaledSize(uw, uh)
+    makeScaler(w, h, t)
+    makeSession(outWidth, outHeight)
+    forceKey = true
+}
+
+// setMaxSize changes the longest edge, 0 meaning the -maxsize flag's, and
+// rebuilds the session only when the encoded size would change. It goes
+// through the same path as a rotation: viewers see a new SPS and a keyframe.
+// Runs on encodeQueue.
+func setMaxSize(_ px: Int) {
+    maxSize = px == 0 ? flagMaxSize : (flagMaxSize > 0 ? min(px, flagMaxSize) : px)
+    guard session != nil else { return }
+    let (uw, uh) = turned(width, height, turn)
+    let size = scaledSize(uw, uh)
+    guard size != (outWidth, outHeight) else { return }
+    rebuild(width, height, turn)
+    log("maxsize \(maxSize): now \(outWidth)x\(outHeight)")
+    onKeyRequest()
+}
+
 // onKeyRequest runs on encodeQueue after a keyframe is asked for. The
 // simulator sets it to capture at once: a static screen composites nothing,
 // and the keyframe waited up to 250ms for the idle floor.
 var onKeyRequest: () -> Void = {}
 
 // startControl reads stdin: EOF means stop; byte 17 asks for a keyframe; 0x80
-// and a u32 sets the bitrate. Parsed as a stream rather than scanned for 17,
+// and a u32 sets the bitrate; 0x81 and a u16 sets the longest edge. Parsed as a stream rather than scanned for 17,
 // because the u32 can contain one.
 func startControl() {
     signal(SIGPIPE, SIG_IGN)
@@ -287,6 +309,11 @@ func startControl() {
                     let bps = q[1...4].reduce(0) { $0 << 8 | Int($1) }
                     q.removeFirst(5)
                     encodeQueue.async { setBitRate(bps) }
+                } else if op == 0x81 {
+                    guard q.count >= 3 else { break }
+                    let px = Int(q[1]) << 8 | Int(q[2])
+                    q.removeFirst(3)
+                    encodeQueue.async { setMaxSize(px) }
                 } else {
                     q.removeFirst()
                 }
