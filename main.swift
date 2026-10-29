@@ -7,6 +7,7 @@
 //   simcap <udid> -input       inject input instead; see input.swift
 //   simcap <udid> -pasteboard  print the pasteboard on each change; see pasteboard.swift
 //   simcap -caps               print what this build can do, one per line
+//   simcap -hostpasteboard     mirror this Mac's own pasteboard; see hostpasteboard.swift
 //   simcap -devices            list physical iPhones and their HID capabilities; see devices.swift
 //   simcap <udid> -phone [name] stream a physical iPhone on a cable instead; see phone.swift
 //   simcap <identifier> -phone-input  a physical iPhone's input; see phoneinput.swift
@@ -44,12 +45,15 @@ func flag(_ name: String, _ def: Int) -> Int {
 // -caps lets the server tell a build with input from an older one, which
 // would read -input as nothing and start streaming video into the reply pipe.
 if args == ["-caps"] {
-    print("video\ninput\nui\nroute\nbitrate\nresize\npasteboard\ndevices\nphone\nphoneinput\nphonewifi")
+    print("video\ninput\nui\nroute\nbitrate\nresize\npasteboard\ndevices\nphone\nphoneinput\nphonewifi\nhostpasteboard")
     exit(0)
 }
 // Before CoreSimulator is loaded: a physical device needs none of it.
 if args.first == "-devices" {
     runDevices(Array(args.dropFirst()))
+}
+if args == ["-hostpasteboard"] {
+    runHostPasteboard()
 }
 if args.count == 2, args[1] == "-phone-input" {
     runPhoneInput(identifier: args[0])
