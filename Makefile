@@ -4,7 +4,7 @@
 # nested inside CoreDevice.framework.
 CDMS_DIR := /Library/Developer/PrivateFrameworks/CoreDevice.framework/Versions/A/Frameworks
 SRC := main.swift input.swift ax.swift hub.swift pasteboard.swift displays.swift devices.swift \
-	encoder.swift phone.swift phoneinput.swift wifi.swift
+	encoder.swift phone.swift phoneinput.swift wifi.swift hostpasteboard.swift
 
 .PHONY: simcap clean
 
