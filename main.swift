@@ -45,7 +45,7 @@ func flag(_ name: String, _ def: Int) -> Int {
 // -caps lets the server tell a build with input from an older one, which
 // would read -input as nothing and start streaming video into the reply pipe.
 if args == ["-caps"] {
-    print("video\ninput\nui\nroute\nbitrate\nresize\npasteboard\ndevices\nphone\nphoneinput\nphonewifi\nhostpasteboard")
+    print("video\ninput\nui\nroute\nbitrate\nresize\npasteboard\npasteboardimage\ndevices\nphone\nphoneinput\nphonewifi\nhostpasteboard")
     exit(0)
 }
 // Before CoreSimulator is loaded: a physical device needs none of it.

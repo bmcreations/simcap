@@ -62,6 +62,25 @@ final class HubPasteboard {
         }.get()
     }
 
+    // setImage puts the image file at path on the pasteboard, for an edit
+    // menu's Paste to put into a field. It crosses as the NSImage AppKit
+    // writes, TIFF, which a UIKit text view pastes as an image; NSImage
+    // reads png, jpeg, gif, webp and heic. The longer wait is for a large
+    // picture's TIFF, which runs to width x height x 4 bytes.
+    func setImage(path: String) throws {
+        try Self.blocking(30) { [pb] in
+            guard let img = NSImage(contentsOfFile: path), img.isValid else {
+                throw InputError("not an image AppKit can read")
+            }
+            let scratch = NSPasteboard.withUniqueName()
+            defer { scratch.releaseGlobally() }
+            scratch.clearContents()
+            guard scratch.writeObjects([img]) else { throw InputError("NSPasteboard took no image") }
+            let snap = try PasteboardSnapshot(from: scratch, dataPolicy: .allResolved)
+            _ = try await pb.setPasteboardContents(pasteboardName: generalPasteboard, pasteboardSnapshot: snap)
+        }.get()
+    }
+
     // watch calls onChange with the text of each change until the stream
     // ends. A snapshot marked confidential, which is how a password manager
     // copies, is passed as nil: the viewer is told something was copied and
