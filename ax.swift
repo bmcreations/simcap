@@ -111,6 +111,28 @@ final class AXTree {
         return translation
     }
 
+    // hit is the element at a point, in the screen's points, as one node in
+    // the shape dump gives, without children; [:] when the point hits
+    // nothing. Some elements are on screen and reachable only this way: with
+    // the keyboard up, the edit menu's items have no parent, so dump's walk
+    // from the application never meets them. Measured in Flipcash on an
+    // iPhone 17 simulator, iOS 27: Paste hit as an AXStaticText at
+    // (20,444) 70x44 while dump had no trace of it. Each call took about 5ms.
+    func hit(_ pt: CGPoint) throws -> [String: Any] {
+        typealias AtFn = @convention(c) (AnyObject, Selector, CGPoint, UInt32, AnyObject) -> Unmanaged<AnyObject>?
+        let sel = NSSelectorFromString("objectAtPoint:displayId:bridgeDelegateToken:")
+        guard let imp = class_getMethodImplementation(type(of: translator), sel)
+        else { throw InputError("AXPTranslator has no objectAtPoint") }
+        let at = unsafeBitCast(imp, to: AtFn.self)
+        guard let found = at(translator, sel, pt, 0, token)?.takeUnretainedValue() as? NSObject else { return [:] }
+        found.setValue(token, forKey: "bridgeDelegateToken")
+        guard let e = translator.perform(NSSelectorFromString("macPlatformElementFromTranslation:"), with: found)?
+            .takeUnretainedValue() as? NSObject
+        else { return [:] }
+        _ = stamp(e)
+        return fields(e)
+    }
+
     func dump() throws -> [String: Any] {
         let translation = try front()
         guard let root = translator.perform(NSSelectorFromString("macPlatformElementFromTranslation:"), with: translation)?
@@ -142,10 +164,8 @@ final class AXTree {
         return t
     }
 
-    private func read(_ e: NSObject, parent: Elem?, depth: Int, into all: inout [Elem]) -> Elem {
-        let el = Elem(translation: stamp(e))
-        el.parent = parent
-        all.append(el)
+    // fields are an element's own attributes, in the shape -input's ui gives.
+    private func fields(_ e: NSObject) -> [String: Any] {
         func str(_ key: String) -> String? {
             guard let v = e.value(forKey: key) else { return nil }
             let s = (v as? String) ?? (v as? NSAttributedString)?.string ?? (v is NSNull ? nil : "\(v)")
@@ -162,10 +182,17 @@ final class AXTree {
         if let v = str("accessibilityIdentifier") { n["id"] = v }
         if let f = (e.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue {
             n["frame"] = [f.origin.x, f.origin.y, f.size.width, f.size.height]
-            el.frame = f
         }
         if let enabled = e.value(forKey: "accessibilityEnabled") as? Bool, !enabled { n["disabled"] = true }
-        el.fields = n
+        return n
+    }
+
+    private func read(_ e: NSObject, parent: Elem?, depth: Int, into all: inout [Elem]) -> Elem {
+        let el = Elem(translation: stamp(e))
+        el.parent = parent
+        all.append(el)
+        el.fields = fields(e)
+        if let f = (e.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue { el.frame = f }
         if depth < maxDepth, let kids = e.value(forKey: "accessibilityChildren") as? [NSObject] {
             el.children = kids.map { read($0, parent: el, depth: depth + 1, into: &all) }
         }

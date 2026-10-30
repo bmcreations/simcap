@@ -460,6 +460,17 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
                 writeReply(reply)
                 continue
             }
+            // hit X Y: the element at a point, in points.
+            if f[0] == "hit" {
+                do {
+                    guard f.count == 3, let x = Double(f[1]), let y = Double(f[2]) else { throw InputError("hit X Y") }
+                    if tree == nil { tree = try AXTree(device: device) }
+                    let data = try JSONSerialization.data(withJSONObject: try tree!.hit(CGPoint(x: x, y: y)), options: [.sortedKeys])
+                    reply = "ok " + String(decoding: data, as: UTF8.self)
+                } catch { reply = "err \(error)" }
+                writeReply(reply)
+                continue
+            }
             if f[0] == "ui" || f[0] == "front" {
                 do { reply = try f[0] == "ui" ? ui() : front() } catch { reply = "err \(error)" }
                 writeReply(reply)
