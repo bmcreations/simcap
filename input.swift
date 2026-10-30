@@ -427,14 +427,22 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
             }
             // The pasteboard is CoreDevice's too, opened on first use.
             // `pbget` answers `ok <base64>`; `pbset <base64>` sets it. An
-            // empty pasteboard is `ok` with nothing after it.
-            if f[0] == "pbget" || f[0] == "pbset" {
+            // empty pasteboard is `ok` with nothing after it. `pbsetimg
+            // <base64 path>` sets the image in that file; the bytes stay in
+            // the file rather than on this line.
+            if f[0] == "pbget" || f[0] == "pbset" || f[0] == "pbsetimg" {
                 do {
                     if pasteboard == nil { pasteboard = HubPasteboard.open(udid: udid) }
                     let pb = try pasteboard!.get()
                     if f[0] == "pbget" {
                         let b64 = Data(try pb.text().utf8).base64EncodedString()
                         reply = b64.isEmpty ? "ok" : "ok \(b64)"
+                    } else if f[0] == "pbsetimg" {
+                        guard let data = Data(base64Encoded: f.count > 1 ? String(f[1]) : ""),
+                              let path = String(data: data, encoding: .utf8)
+                        else { throw InputError("pbsetimg BASE64-PATH") }
+                        try pb.setImage(path: path)
+                        reply = "ok"
                     } else {
                         guard let data = Data(base64Encoded: f.count > 1 ? String(f[1]) : ""),
                               let text = String(data: data, encoding: .utf8)
