@@ -100,16 +100,19 @@ final class HubHID {
 
     enum Kind { case button, keyboard, digitizer }
 
-    // validate asks CoreDevice for the capability again and throws if it
-    // cannot be had. CoreDevice gives no delivery signal: sendBarrier() is
-    // `() -> ()` on all three HID protocols, with no throw and no completion,
-    // and a send on a capability whose tunnel has dropped was seen to return
-    // without throwing. So this is the only evidence available after a send,
-    // and `ok` after it means "sent, and the capability still answered", not
-    // "the phone received it". A report dropped while the capability still
-    // answers is not caught. Blocks the calling thread for up to `seconds`.
+    // validate asks CoreDevice for the capability again and then asks the
+    // phone for its lock state, and throws if either fails or the two take
+    // longer than `seconds`. CoreDevice gives no delivery signal:
+    // sendBarrier() is `() -> ()` on all three HID protocols, with no throw
+    // and no completion, and a send on a capability whose tunnel has dropped
+    // was seen to return without throwing. The capability lookup alone is
+    // answered on the Mac and passed with the phone off Wi-Fi, so the lock
+    // state, which only the phone can answer, is what shows the tunnel is up
+    // (170-610ms over Wi-Fi here). `ok` after it means "sent, and the phone
+    // answered right after", not "the phone received it". Blocks the calling
+    // thread for up to `seconds`.
     func validate(_ kind: Kind, within seconds: Double = 3) throws {
-        var failure: InputError? = InputError("CoreDevice: capability did not answer in \(Int(seconds))s")
+        var failure: InputError? = InputError("CoreDevice: the phone did not answer in \(seconds)s")
         let done = DispatchSemaphore(value: 0)
         let dev = device
         Task.detached {
@@ -120,6 +123,7 @@ final class HubHID {
                 case .keyboard: _ = try await implementation(dev, CapabilityStaticMember<HIDDeviceCapability>.keyboard)
                 case .digitizer: _ = try await implementation(dev, CapabilityStaticMember<HIDDeviceCapability>.digitizer)
                 }
+                _ = try await dev.currentLockState
                 failure = nil
             } catch {
                 failure = InputError("CoreDevice: \(error)")
@@ -127,6 +131,20 @@ final class HubHID {
         }
         _ = done.wait(timeout: .now() + seconds)
         if let failure { throw failure }
+    }
+
+    // answers asks the phone for its lock state and reports whether it
+    // answered within `seconds`. The heartbeat in -phone-input uses it.
+    func answers(within seconds: Double) -> Bool {
+        let ok = OSAllocatedFlag()
+        let done = DispatchSemaphore(value: 0)
+        let dev = device
+        Task.detached {
+            defer { done.signal() }
+            if (try? await dev.currentLockState) != nil { ok.set() }
+        }
+        _ = done.wait(timeout: .now() + seconds)
+        return ok.value
     }
 
     // Consumer page: 0x40 Menu is Home and 0x30 Power is lock, both run.
@@ -243,4 +261,13 @@ func digitizerTarget() -> DigitizerTarget {
                                   .display6, .display7, .display8, .display9, .display10]
     guard let id = litDisplay()?.id, id >= 1, Int(id) <= all.count else { return .mainScreen }
     return all[Int(id) - 1]
+}
+
+// OSAllocatedFlag is a Bool that one thread sets and another reads.
+final class OSAllocatedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v = false
+    func set() { lock.lock(); v = true; lock.unlock() }
+    func clear() { lock.lock(); v = false; lock.unlock() }
+    var value: Bool { lock.lock(); defer { lock.unlock() }; return v }
 }

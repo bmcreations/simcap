@@ -28,8 +28,11 @@
 // (phoneInputBudget in iosdeviceinput.go, 15s), so CoreDevice's error reaches
 // the caller instead of the server timing out first and killing this process
 // mid-open. The worst cold command is the sum of the waits: HubHID.open 5s,
-// phoneScreen 4s, the pre-send check 2s and the post-send check 2s, 13s. The
-// viewer's touch and touch2, keydown and keyup are never checked.
+// phoneScreen 4s, the pre-send check 2s and the post-send check 2s, 13s. A
+// check is a capability lookup and then the phone's lock state, which only
+// the phone can answer: the lookup alone is answered on the Mac and passed
+// with the phone off Wi-Fi. The viewer's touch and touch2, keydown and keyup
+// are not checked one by one; a heartbeat covers them (see `lost`).
 
 import CoreDevice
 import Foundation
@@ -73,8 +76,10 @@ private struct Undelivered: Error, CustomStringConvertible {
     let description: String
 }
 
-// How long a capability check may take, before a send and after one.
+// How long a check may take, before a send and after one.
 private let checkSeconds = 2.0
+// How often the heartbeat asks the phone whether it is still there.
+private let heartbeatSeconds = 2.0
 
 func runPhoneInput(identifier: String) -> Never {
     guard let want = UUID(uuidString: identifier) else {
@@ -83,12 +88,75 @@ func runPhoneInput(identifier: String) -> Never {
     var hub: Result<HubHID, InputError>?
     var screen: (Int, Int)?
 
+    // The viewer's touch, touch2, keydown and keyup are not checked one by
+    // one: a round trip on every down would add 170-610ms to a drag over
+    // Wi-Fi. A heartbeat asks the phone for its lock state every
+    // heartbeatSeconds instead, and once it goes unanswered `lost` is set
+    // and those commands answer `err unreachable` without sending, rather
+    // than `ok` into a dead tunnel. A command that finds `lost` set reopens
+    // and asks the phone once itself, so the process recovers as soon as the
+    // server's devicectl wake brings the tunnel back.
+    let lost = OSAllocatedFlag()
+    let beat = NSLock()
+    var beating: HubHID?
+    //
+    // The heartbeat also holds a usage assertion on the device, the hold
+    // devicectl takes for its own commands. CoreDeviceService lets a tunnel
+    // go about 15s after its last assertion, and remotepairingd then cancels
+    // it ('No active usage assertions'): without one, an open -phone-input
+    // lost its tunnel 15-34s after each devicectl wake, however often it
+    // sent. A fresh assertion is taken whenever the phone stops answering.
+    let held = NSLock()
+    var assertion: DeviceUsageAssertion?  // held, not read: dropping it releases the tunnel
+    // hold takes a fresh assertion, which also brings a closed tunnel up
+    // the way a devicectl command does, so it does not need an open HubHID.
+    func hold() {
+        nonisolated(unsafe) var got: DeviceUsageAssertion?
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            defer { done.signal() }
+            guard let dev = await coreDevice(want) else { return }
+            got = try? await dev.acquireDeviceUsageAssertion(
+                withReason: "simcap -phone-input", options: UsageAssertionOptions(requiredPreparedness: .powerAssertionTaken))
+        }
+        _ = done.wait(timeout: .now() + 30)
+        // A wait that runs out drops an assertion that arrives later; the
+        // next heartbeat asks again.
+        held.lock(); let had = assertion != nil; assertion = got; held.unlock()
+        if got == nil && had { log("phone-input: lost the usage assertion; asking again every \(Int(heartbeatSeconds))s") }
+    }
+    Thread.detachNewThread {
+        hold()
+        while true {
+            Thread.sleep(forTimeInterval: heartbeatSeconds)
+            beat.lock(); let h = beating; beat.unlock()
+            held.lock(); let holding = assertion != nil; held.unlock()
+            if let h, !h.answers(within: checkSeconds) { lost.set() }
+            if !holding || lost.value { hold() }
+        }
+    }
+    // live is the pre-send step for the unchecked commands.
+    func live() throws -> HubHID {
+        guard lost.value else { return try hid() }
+        hub = nil
+        beat.lock(); beating = nil; beat.unlock()
+        let h = try hid()
+        guard h.answers(within: checkSeconds) else {
+            hub = nil
+            throw Unreachable(description: "the phone stopped answering CoreDevice")
+        }
+        lost.clear()
+        return h
+    }
+
     // Both are opened on first use and a failure is retried on the next
     // command: a phone that has just been plugged in may not be listed yet.
     func hid() throws -> HubHID {
         if hub == nil { hub = HubHID.open(udid: identifier) }
         switch hub! {
-        case .success(let h): return h
+        case .success(let h):
+            beat.lock(); beating = h; beat.unlock()
+            return h
         case .failure(let e):
             hub = nil
             throw Unreachable(description: e.description)
@@ -167,7 +235,7 @@ func runPhoneInput(identifier: String) -> Never {
             // The viewer's live touch: no capability check, so a down cannot
             // hold up the message loop behind it.
             let (x, y) = try pre { try norm(px, py) }
-            let h = try pre { try hid() }
+            let h = try pre { try live() }
             try send { try h.touch(ph, x, y) }
         case "touch2":
             guard f.count == 6 else { throw InputError("touch2 down|move|up X0 Y0 X1 Y1") }
@@ -177,7 +245,7 @@ func runPhoneInput(identifier: String) -> Never {
                 let a = try norm(px0, py0), b = try norm(px1, py1)
                 return (a.0, a.1, b.0, b.1)
             }
-            let h = try pre { try hid() }
+            let h = try pre { try live() }
             try send { try h.touch2(ph, x0, y0, x1, y1) }
         case "tap":
             let (px, py) = (try num(1), try num(2))
@@ -263,7 +331,7 @@ func runPhoneInput(identifier: String) -> Never {
             }
         case "keydown", "keyup":
             let u = UInt32(try num(1))
-            let h = try pre { try hid() }
+            let h = try pre { try live() }
             try send { try h.key(u, down: f[0] == "keydown") }
         default:
             throw InputError("unknown command \(f[0])")
