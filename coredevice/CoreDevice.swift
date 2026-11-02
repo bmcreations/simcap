@@ -36,7 +36,29 @@ extension CapabilityStaticMember where A == HIDDeviceCapability {
 
 open class RemoteDevice {
   open var deviceIdentifier: UUID { get { fatalError() } set {} }
+  // Answered by the phone itself, so it is also a round trip to it.
+  open var currentLockState: LockState { get async throws { fatalError() } }
+  // Holds the tunnel open while the assertion lives. Without one,
+  // CoreDeviceService lets the tunnel go about 15s after its last user and
+  // remotepairingd cancels it: 'No active usage assertions'.
+  public final func acquireDeviceUsageAssertion(withReason: String, options: UsageAssertionOptions) async throws -> DeviceUsageAssertion { fatalError() }
   open func getImplementation<A: DeviceCapability>(for: CapabilityStaticMember<A>) async throws -> A.ProtocolType { fatalError() }
+}
+
+open class DeviceUsageAssertion {}
+
+public struct UsageAssertionOptions {
+  public init(requiredPreparedness: DevicePreparedness) { fatalError() }
+}
+
+public struct DevicePreparedness {
+  public init(rawValue: Int) { fatalError() }
+  public static var powerAssertionTaken: DevicePreparedness { fatalError() }
+}
+
+public struct LockState {
+  public var hasBeenUnlockedSinceBoot: Bool { fatalError() }
+  public var isPasscodeRequired: Bool { fatalError() }
 }
 
 public protocol CoreDeviceServiceConnection {}
