@@ -82,6 +82,94 @@ private func watchNegotiation(receiver: @escaping (String, UInt16) -> Void, ssrc
     return p
 }
 
+// MARK: - latency
+
+// LatencyLog is measurement only, on with SIMCAP_LATENCY=1. It logs t0 as wall
+// time once, so a client on this Mac can turn any PTS into a wall time, and
+// every 5s how long the H.264 track spends between an access unit's arrival
+// and its re-encode starting: the decode the passthrough skips. A PTS on the
+// H.264 track is stamped at that start, so a client measuring from PTS adds
+// this to get the same arrival reference the HEVC track's PTS has.
+final class LatencyLog {
+    private let lock = NSLock()
+    private var waits: [Double] = []
+
+    init() {
+        let start = t0
+        let now = DispatchTime.now().uptimeNanoseconds
+        let wall = Date().timeIntervalSince1970 * 1e6 - Double(now - start) / 1000
+        log("latency: t0 wall \(UInt64(wall)) us")
+        let timer = DispatchSource.makeTimerSource(queue: .global())
+        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.setEventHandler { [weak self] in self?.report() }
+        timer.resume()
+        _ = Unmanaged.passRetained(timer as AnyObject)
+    }
+
+    func note(_ arrived: UInt64) {
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - arrived) / 1e6
+        lock.withLock { waits.append(ms) }
+    }
+
+    private func report() {
+        let w = lock.withLock { () -> [Double] in defer { waits = [] }; return waits.sorted() }
+        guard !w.isEmpty else { return }
+        func p(_ q: Double) -> String { String(format: "%.1f", w[min(w.count - 1, Int(Double(w.count) * q))]) }
+        log("latency: arrival to H.264 encode n=\(w.count) p50 \(p(0.5))ms p90 \(p(0.9))ms max \(p(1))ms")
+    }
+}
+
+let latency: LatencyLog? = ProcessInfo.processInfo.environment["SIMCAP_LATENCY"] == "1" ? LatencyLog() : nil
+
+// MARK: - passthrough
+
+// HEVCPassthrough writes the phone's own access units to fd 3, in the wire
+// format stdout uses (encoder.swift): a 64-byte name, "h265" and the size,
+// then a 12-byte header per packet. Nothing is decoded or re-encoded, so a
+// viewer that can decode HEVC skips both. A config packet carries VPS, SPS and
+// PPS whenever they change, and every IRAP access unit carries them in front
+// as well, so the stream decodes from any keyframe on its own. The PTS is when
+// the access unit's first packet arrived, on the same clock as the H.264
+// track's.
+final class HEVCPassthrough {
+    private let out = FileHandle(fileDescriptor: 3, closeOnDealloc: false)
+    private var started = false
+    private var lastParams = Data()
+    private(set) var written = 0
+
+    init() {
+        if fcntl(3, F_GETFD) == -1 { fail("-hevc writes to fd 3, which is not open") }
+    }
+
+    private func write(_ d: Data) {
+        do { try out.write(contentsOf: d) } catch { exit(0) } // the reader is gone
+    }
+
+    // au is the access unit's NAL units without start codes, parameter sets
+    // and delimiters already taken out.
+    func send(vps: Data, sps: Data, pps: Data, format: CMVideoFormatDescription, nals: [Data], key: Bool, pts: UInt64) {
+        if !started {
+            // A viewer cannot start mid-GOP, so neither does the stream.
+            guard key else { return }
+            started = true
+            let dim = CMVideoFormatDescriptionGetDimensions(format)
+            var name = Data(streamName.utf8.prefix(63))
+            name += Data(count: 64 - name.count)
+            write(name + be32(0x6832_3635) + be32(UInt32(dim.width)) + be32(UInt32(dim.height))) // "h265"
+            log("hevc: passthrough \(dim.width)x\(dim.height) on fd 3")
+        }
+        let params = startCode + vps + startCode + sps + startCode + pps
+        if params != lastParams {
+            lastParams = params
+            write(be64(flagConfig) + be32(UInt32(params.count)) + params)
+        }
+        var au = key ? params : Data()
+        for n in nals { au += startCode + n }
+        write(be64(pts | (key ? flagKey : 0)) + be32(UInt32(au.count)) + au)
+        written += 1
+    }
+}
+
 // MARK: - RTP in, HEVC out
 
 final class WifiReceiver {
@@ -97,6 +185,8 @@ final class WifiReceiver {
     // Depacketiser state, owned by the receive thread.
     private var lastSeq = -1
     private var auTS: UInt32?
+    private var auArrival: UInt64 = 0  // uptime ns of the access unit's first packet
+    let passthrough: HEVCPassthrough? = hevcOut ? HEVCPassthrough() : nil
     private var nals: [Data] = []
     private var fu: Data?
     private var broken = true         // drop until the next IRAP picture
@@ -104,7 +194,7 @@ final class WifiReceiver {
     private var format: CMVideoFormatDescription?
     private var decoder: VTDecompressionSession?
     var last: CVPixelBuffer?          // the newest decoded picture, on encodeQueue
-    private var packets = 0, pictures = 0
+    private var packets = 0, pictures = 0, keys = 0
 
     init?(ip: String, port: UInt16) {
         fd = socket(AF_INET6, SOCK_DGRAM, 0)
@@ -210,6 +300,7 @@ final class WifiReceiver {
         }
         lastSeq = seq
         if let t = auTS, t != ts { flush() }
+        if auTS == nil { auArrival = DispatchTime.now().uptimeNanoseconds }
         auTS = ts
 
         let p = UnsafeRawBufferPointer(rebasing: b[off..<end])
@@ -255,6 +346,7 @@ final class WifiReceiver {
         guard !nals.isEmpty else { return }
         var key = false, params = false
         var body = Data()
+        var picture: [Data] = []
         for n in nals where n.count >= 2 {
             let t = (n[n.startIndex] >> 1) & 0x3f
             switch t {
@@ -266,6 +358,7 @@ final class WifiReceiver {
                 if (16...21).contains(t) { key = true }
                 body.append(contentsOf: bytes32(UInt32(n.count)))
                 body.append(n)
+                if passthrough != nil { picture.append(n) }
             }
         }
         if params || format == nil { makeDecoder() }
@@ -273,6 +366,13 @@ final class WifiReceiver {
         if broken {
             guard key else { return }
             broken = false
+        }
+        if let passthrough, let vps, let sps, let pps {
+            // t0 first, as encodePixels reads it.
+            let start = t0
+            let pts = (max(auArrival, start) - start) / 1000
+            passthrough.send(vps: vps, sps: sps, pps: pps, format: format, nals: picture, key: key, pts: pts)
+            if key { keys += 1 }
         }
         var block: CMBlockBuffer?
         let len = body.count
@@ -285,6 +385,7 @@ final class WifiReceiver {
         guard CMSampleBufferCreateReady(allocator: nil, dataBuffer: block, formatDescription: format, sampleCount: 1,
                                         sampleTimingEntryCount: 0, sampleTimingArray: nil, sampleSizeEntryCount: 1,
                                         sampleSizeArray: &size, sampleBufferOut: &sbuf) == noErr, let sbuf else { return }
+        let arrived = auArrival
         let st = VTDecompressionSessionDecodeFrame(decoder, sampleBuffer: sbuf, flags: [], infoFlagsOut: nil) { [weak self] st, _, pb, _, _ in
             guard let self else { return }
             if st != noErr || pb == nil {
@@ -297,7 +398,10 @@ final class WifiReceiver {
                     log("wifi: first picture \(CVPixelBufferGetWidth(pixels))x\(CVPixelBufferGetHeight(pixels))")
                 }
                 self.last = pixels
-                if DispatchTime.now().uptimeNanoseconds - lastEncode >= minGap { encodePixels(pixels, 0) }
+                if DispatchTime.now().uptimeNanoseconds - lastEncode >= minGap {
+                    latency?.note(arrived)
+                    encodePixels(pixels, 0)
+                }
             }
         }
         if st != noErr { lose("decode \(st)") }
@@ -343,6 +447,17 @@ final class WifiReceiver {
         broken = true
     }
 
+    // logPassthrough says how many access units and keyframes went out
+    // since the last call, which is how often the phone sends an IRAP.
+    private var loggedAU = 0, loggedKeys = 0
+    func logPassthrough() {
+        guard let passthrough else { return }
+        let n = passthrough.written, k = keys
+        log("hevc: \(n - loggedAU) access units, \(k - loggedKeys) keyframes in 5s")
+        loggedAU = n
+        loggedKeys = k
+    }
+
     // MARK: RTCP out
 
     // reportLoop sends a receiver report and our SDES twice a second, under
@@ -372,6 +487,13 @@ final class WifiReceiver {
             sent += 1
             if sent == 1 { log("wifi: reporting as SSRC \(me) to SSRC \(remote)") }
         }
+    }
+
+    // requestKeyframe is a viewer's ask, through stdin's byte 17. The H.264
+    // encoder makes its own; the passthrough has only the phone's.
+    func requestKeyframe() {
+        guard passthrough != nil else { return }
+        sendPLI()
     }
 
     // sendPLI asks the phone for a keyframe (RFC 4585), at most five times a
@@ -459,6 +581,14 @@ func runPhoneWifi(identifier: String, name: String) -> Never {
         }
     }
     idle.resume()
+    if hevcOut {
+        onKeyRequest = { wifiReceiver?.requestKeyframe() }
+        let report = DispatchSource.makeTimerSource(queue: .global())
+        report.schedule(deadline: .now() + 5, repeating: 5)
+        report.setEventHandler { wifiReceiver?.logPassthrough() }
+        report.resume()
+        _ = Unmanaged.passRetained(report as AnyObject)
+    }
     startControl()
     dispatchMain()
 }

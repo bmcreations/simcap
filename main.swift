@@ -12,6 +12,7 @@
 //   simcap <udid> -phone [name] stream a physical iPhone on a cable instead; see phone.swift
 //   simcap <identifier> -phone-input  a physical iPhone's input; see phoneinput.swift
 //   simcap <identifier> -phone-wifi [name]  stream a physical iPhone over Wi-Fi; see wifi.swift
+//   simcap <identifier> -phone-wifi [name] -hevc  the same, plus the phone's HEVC on fd 3
 //
 // The framebuffer is reached through CoreSimulator and SimulatorKit, which are
 // private and move with Xcode, so this is built on its own rather than by
@@ -45,7 +46,7 @@ func flag(_ name: String, _ def: Int) -> Int {
 // -caps lets the server tell a build with input from an older one, which
 // would read -input as nothing and start streaming video into the reply pipe.
 if args == ["-caps"] {
-    print("video\ninput\nui\nroute\nbitrate\nresize\npasteboard\npasteboardimage\nhit\ndevices\nphone\nphoneinput\nphonewifi\nhostpasteboard")
+    print("video\ninput\nui\nroute\nbitrate\nresize\npasteboard\npasteboardimage\nhit\ndevices\nphone\nphoneinput\nphonewifi\nphonehevc\nhostpasteboard")
     exit(0)
 }
 // Before CoreSimulator is loaded: a physical device needs none of it.
@@ -66,6 +67,10 @@ if args.count == 2, args[1] == "-pasteboard" {
 }
 let inputMode = args.contains("-input")
 args.removeAll { $0 == "-input" }
+// -hevc, with -phone-wifi: also write the phone's own HEVC, undecoded, to fd 3
+// in the same wire format as stdout's H.264 (wifi.swift, "passthrough").
+let hevcOut = args.contains("-hevc")
+args.removeAll { $0 == "-hevc" }
 // A var because stdin can change it; a session rebuilt for a new shape keeps
 // the rate last set rather than going back to the flag's.
 var bitRate = flag("-bitrate", 8_000_000)
