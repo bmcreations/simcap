@@ -32,9 +32,22 @@ use std::{future::Future, pin::Pin};
 
 const AX_SERVICE: &str = "com.apple.accessibility.axAuditDaemon.remoteAXService";
 // How long to wait for the next archive before deciding the phone is done
-// (one-shot) and the overall ceiling on a single run.
+// (one-shot fallback) and the overall ceiling on a single run.
 const QUIET_AFTER: Duration = Duration::from_secs(3);
 const HARD_CAP: Duration = Duration::from_secs(20);
+
+// The phone pushes an InitialDump (geometry + labels), then an AdditionalData
+// dump (adds roles), then unasked re-sends and an orientation message. These
+// ASCII markers sit in the archive's $objects. A tree dump carries one of
+// them; the orientation message carries neither. Scanning for them keeps the
+// bridge dumb -- no plist parsing -- while filtering non-tree frames and giving
+// one-shot a correct stop point (the first AdditionalData), not a guessed timer.
+const MARK_INITIAL: &[u8] = b"AXPTreeDumpTypeInitialDump";
+const MARK_ADDITIONAL: &[u8] = b"AXPTreeDumpTypeAdditionalData";
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    needle.len() <= hay.len() && hay.windows(needle.len()).any(|w| w == needle)
+}
 
 /// usbmuxd for the socket, the pair record read straight from usbmuxd:
 /// idevice's own get_pair_record over usbmuxd hangs.
@@ -177,7 +190,8 @@ async fn main() {
     let mut caps = plist::Dictionary::new();
     caps.insert("com.apple.private.DTXBlockCompression".into(), 2u64.into());
     caps.insert("com.apple.private.DTXConnection".into(), 1u64.into());
-    c.root_channel()
+    if let Err(e) = c
+        .root_channel()
         .call_method(
             Some("_notifyOfPublishedCapabilities:"),
             Some(vec![idevice::dvt::message::AuxValue::archived_value(
@@ -186,7 +200,10 @@ async fn main() {
             false,
         )
         .await
-        .expect("publish capabilities");
+    {
+        eprintln!("simcap-bridge: publish capabilities: {e:?}");
+        std::process::exit(1);
+    }
     // Drain the phone's own capability handshake.
     for _ in 0..2 {
         let _ = tokio::time::timeout(Duration::from_secs(3), c.root_channel().read_message()).await;
@@ -218,17 +235,28 @@ async fn main() {
         let wait = if follow { Duration::from_secs(3600) } else { QUIET_AFTER };
         match tokio::time::timeout(wait, c.root_channel().read_message()).await {
             Ok(Ok(m)) => {
-                // aux[0] of a processDataFromRemoteDevice: message is the tree
-                // dump archive. Emit each Array aux value as a frame.
+                // A tree-dump message carries the archive as an Array aux value.
+                // Emit only archives that carry a dump-type marker, so the
+                // phone's orientation message and other chatter never reach the
+                // decoder. One-shot stops after the first AdditionalData dump.
+                let mut saw_additional = false;
                 if let Some(aux) = m.aux.as_ref() {
                     for v in &aux.values {
                         if let idevice::dvt::message::AuxValue::Array(bytes) = v {
+                            let additional = contains(bytes, MARK_ADDITIONAL);
+                            if !additional && !contains(bytes, MARK_INITIAL) {
+                                continue;
+                            }
                             if emit(&mut out, bytes).is_err() {
                                 return; // loupe closed the pipe
                             }
                             frames += 1;
+                            saw_additional |= additional;
                         }
                     }
+                }
+                if saw_additional && !follow {
+                    break;
                 }
             }
             Ok(Err(e)) => {
@@ -236,12 +264,13 @@ async fn main() {
                 break;
             }
             Err(_) => {
-                // Timed out. One-shot: quiet means the dump pair has landed.
-                if !follow && frames > 0 {
-                    break;
-                }
+                // Timed out waiting for the next message. One-shot fallback: if
+                // dumps already landed, the phone has gone quiet; otherwise it
+                // never sent a tree.
                 if !follow {
-                    eprintln!("simcap-bridge: no tree dump within {QUIET_AFTER:?}");
+                    if frames == 0 {
+                        eprintln!("simcap-bridge: no tree dump within {QUIET_AFTER:?}");
+                    }
                     break;
                 }
             }
