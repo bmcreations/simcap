@@ -4,9 +4,9 @@
 # nested inside CoreDevice.framework.
 CDMS_DIR := /Library/Developer/PrivateFrameworks/CoreDevice.framework/Versions/A/Frameworks
 SRC := main.swift input.swift ax.swift hub.swift pasteboard.swift displays.swift devices.swift \
-	encoder.swift phone.swift phoneinput.swift phoneax.swift wifi.swift hostpasteboard.swift
+	encoder.swift phone.swift phoneinput.swift phoneax.swift wifi.swift rtp.swift hostpasteboard.swift
 
-.PHONY: simcap clean
+.PHONY: simcap clean test
 
 # Signed by TEAM when given, so TCC's camera grant for a phone's screen
 # capture survives a rebuild (sign.sh).
@@ -41,6 +41,13 @@ bridge:
 	cargo build --release --manifest-path bridge/Cargo.toml
 	mkdir -p .build
 	cp bridge/target/release/simcap-bridge .build/simcap-bridge
+
+# test: the Wi-Fi depacketiser (rtp.swift) against RTP streams the tests
+# build, no phone needed.
+test:
+	mkdir -p .build
+	xcrun swiftc -parse-as-library rtp.swift tests/rtp_tests.swift -o .build/rtp_tests
+	.build/rtp_tests
 
 clean:
 	rm -rf .build

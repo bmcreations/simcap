@@ -182,14 +182,9 @@ final class WifiReceiver {
     private var lsr: UInt32 = 0, lsrAt: Date?
     private var lastPLI = Date.distantPast
 
-    // Depacketiser state, owned by the receive thread.
-    private var lastSeq = -1
-    private var auTS: UInt32?
-    private var auArrival: UInt64 = 0  // uptime ns of the access unit's first packet
+    // Owned by the receive thread.
+    private var depack = HEVCDepacketizer()
     let passthrough: HEVCPassthrough? = hevcOut ? HEVCPassthrough() : nil
-    private var nals: [Data] = []
-    private var fu: Data?
-    private var broken = true         // drop until the next IRAP picture
     private var vps: Data?, sps: Data?, pps: Data?
     private var format: CMVideoFormatDescription?
     private var decoder: VTDecompressionSession?
@@ -282,72 +277,40 @@ final class WifiReceiver {
         lock.unlock()
         packets += 1
 
-        var off = 12 + 4 * Int(b[0] & 0x0f)
-        if b[0] & 0x10 != 0 {
-            // A one-word header extension, profiles 0x9001 and 0x9011 on
-            // bmc-iphone, not decoded.
-            guard b.count >= off + 4 else { return }
-            off += 4 + 4 * be16(b, off + 2)
-        }
-        var end = b.count
-        if b[0] & 0x20 != 0 { end -= Int(b[b.count - 1]) }
-        guard end > off + 2 else { return }
-
-        if lastSeq >= 0 && seq != (lastSeq + 1) & 0xffff {
-            // RTX and FEC are off in the negotiated config, so a lost
-            // packet is gone. Everything up to the next IRAP is undecodable.
-            lose("packet \(lastSeq + 1) lost")
-        }
-        lastSeq = seq
-        if let t = auTS, t != ts { flush() }
-        if auTS == nil { auArrival = DispatchTime.now().uptimeNanoseconds }
-        auTS = ts
-
-        let p = UnsafeRawBufferPointer(rebasing: b[off..<end])
-        let type = (p[0] >> 1) & 0x3f
-        switch type {
-        case 48: // aggregation packet: u16 size, then that many bytes, repeated
-            var i = 2
-            while i + 2 <= p.count {
-                let n = be16(p, i)
-                guard i + 2 + n <= p.count else { break }
-                nals.append(Data(p[(i + 2)..<(i + 2 + n)]))
-                i += 2 + n
-            }
-        case 49: // fragmentation unit
-            guard p.count > 3 else { return }
-            let h = p[2]
-            if h & 0x80 != 0 {
-                fu = Data([(p[0] & 0x81) | ((h & 0x3f) << 1), p[1]]) + Data(p[3...])
-            } else if fu != nil {
-                fu!.append(contentsOf: p[3...])
-            }
-            if h & 0x40 != 0, let f = fu {
-                nals.append(f)
-                fu = nil
-            }
-        default:
-            nals.append(Data(p))
-        }
-        if marker { flush() }
+        let r = depack.push(b, arrival: DispatchTime.now().uptimeNanoseconds)
+        if let lost = r.lost { lose("packet \(lost) lost") }
+        for u in r.units { decode(u) }
     }
 
+    private var waiting = false
+    private var keyShape = ""
+
+    // noteKeyShape logs a keyframe's slice count, and whether parameter sets
+    // came with it, when that changes. A picture split into several slices is
+    // what a lost packet can leave half decoded.
+    private func noteKeyShape(_ u: HEVCDepacketizer.Unit) {
+        let types = u.nals.filter { $0.count >= 2 }.map { ($0[$0.startIndex] >> 1) & 0x3f }
+        let shape = "\(types.filter { $0 < 32 }.count) slice(s), parameter sets \(types.contains(33) ? "with it" : "not repeated")"
+        if shape != keyShape { log("wifi: keyframe: \(shape)") }
+        keyShape = shape
+    }
+
+    // lose logs a failure once until the next picture decodes, and asks the
+    // phone for a keyframe. The depacketiser already holds back what follows.
     private func lose(_ why: String) {
-        if !broken { log("wifi: \(why); waiting for a keyframe") }
-        broken = true
-        fu = nil
-        nals.removeAll()
+        if !waiting { log("wifi: \(why); waiting for a keyframe") }
+        waiting = true
         sendPLI()
     }
 
-    // flush decodes one access unit.
-    private func flush() {
-        defer { nals.removeAll(); auTS = nil }
-        guard !nals.isEmpty else { return }
-        var key = false, params = false
+    // decode decodes one whole access unit.
+    private func decode(_ u: HEVCDepacketizer.Unit) {
+        let key = u.key
+        if key { noteKeyShape(u) }
+        var params = false
         var body = Data()
         var picture: [Data] = []
-        for n in nals where n.count >= 2 {
+        for n in u.nals where n.count >= 2 {
             let t = (n[n.startIndex] >> 1) & 0x3f
             switch t {
             case 32: if vps != n { vps = n; params = true }
@@ -355,22 +318,22 @@ final class WifiReceiver {
             case 34: if pps != n { pps = n; params = true }
             case 35: break // access unit delimiter
             default:
-                if (16...21).contains(t) { key = true }
                 body.append(contentsOf: bytes32(UInt32(n.count)))
                 body.append(n)
                 if passthrough != nil { picture.append(n) }
             }
         }
-        if params || format == nil { makeDecoder() }
-        guard !body.isEmpty, let format, let decoder else { return }
-        if broken {
-            guard key else { return }
-            broken = false
+        if (params || format == nil) && makeDecoder() && !key {
+            // A new decoder starts at an IRAP picture.
+            depack.resync()
+            return
         }
+        guard !body.isEmpty, let format, let decoder else { return }
+        waiting = false
         if let passthrough, let vps, let sps, let pps {
             // t0 first, as encodePixels reads it.
             let start = t0
-            let pts = (max(auArrival, start) - start) / 1000
+            let pts = (max(u.arrival, start) - start) / 1000
             passthrough.send(vps: vps, sps: sps, pps: pps, format: format, nals: picture, key: key, pts: pts)
             if key { keys += 1 }
         }
@@ -385,7 +348,7 @@ final class WifiReceiver {
         guard CMSampleBufferCreateReady(allocator: nil, dataBuffer: block, formatDescription: format, sampleCount: 1,
                                         sampleTimingEntryCount: 0, sampleTimingArray: nil, sampleSizeEntryCount: 1,
                                         sampleSizeArray: &size, sampleBufferOut: &sbuf) == noErr, let sbuf else { return }
-        let arrived = auArrival
+        let arrived = u.arrival
         let st = VTDecompressionSessionDecodeFrame(decoder, sampleBuffer: sbuf, flags: [], infoFlagsOut: nil) { [weak self] st, _, pb, _, _ in
             guard let self else { return }
             if st != noErr || pb == nil {
@@ -404,12 +367,18 @@ final class WifiReceiver {
                 }
             }
         }
-        if st != noErr { lose("decode \(st)") }
+        if st != noErr {
+            depack.resync()
+            lose("decode \(st)")
+        }
         pictures += 1
     }
 
-    private func makeDecoder() {
-        guard let vps, let sps, let pps else { return }
+    // makeDecoder makes a format from the parameter sets, and a decoder when
+    // the one there cannot take it. It reports whether it made a decoder.
+    @discardableResult
+    private func makeDecoder() -> Bool {
+        guard let vps, let sps, let pps else { return false }
         var desc: CMFormatDescription?
         let st = vps.withUnsafeBytes { v in sps.withUnsafeBytes { s in pps.withUnsafeBytes { p in
             let ptrs = [v, s, p].map { $0.bindMemory(to: UInt8.self).baseAddress! }
@@ -421,11 +390,11 @@ final class WifiReceiver {
         } } }
         guard st == noErr, let desc else {
             log("wifi: HEVC parameter sets: \(st)")
-            return
+            return false
         }
         if let decoder, VTDecompressionSessionCanAcceptFormatDescription(decoder, formatDescription: desc) {
             format = desc
-            return
+            return false
         }
         if let decoder { VTDecompressionSessionInvalidate(decoder) }
         let attrs: [CFString: Any] = [
@@ -438,13 +407,13 @@ final class WifiReceiver {
                                              decompressionSessionOut: &s)
         guard r == noErr, let s else {
             log("wifi: HEVC decoder: \(r)")
-            return
+            return false
         }
         let dim = CMVideoFormatDescriptionGetDimensions(desc)
         log("wifi: HEVC \(dim.width)x\(dim.height)")
         format = desc
         decoder = s
-        broken = true
+        return true
     }
 
     // logPassthrough says how many access units and keyframes went out
