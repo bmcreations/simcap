@@ -1,0 +1,20 @@
+# simcap-bridge: opens the phone's accessibility tunnel in Rust and streams the
+# raw tree-dump archives to stdout. simcap (Swift) can't reach
+# com.apple.accessibility.axAuditDaemon.remoteAXService through CoreDevice --
+# remoted refuses the service to CoreDeviceService -- so the AX path runs over
+# idevice's own CoreDevice tunnel instead. Video and input stay on simcap.
+[package]
+name = "simcap-bridge"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "simcap-bridge"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to the rev the spike proved out (v0.1.68). MIT, Jackson Coxson --
+# recorded in loupe THIRD_PARTY_NOTICES.md.
+idevice = { git = "https://github.com/jkcoxson/idevice.git", rev = "8970209", default-features = false, features = ["core_device_proxy", "tunnel_tcp_stack", "rsd", "usbmuxd", "dvt", "xpc", "ring", "tcp"] }
+tokio = { version = "1.43", features = ["full"] }
+plist = "1"

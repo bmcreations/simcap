@@ -4,7 +4,7 @@
 # nested inside CoreDevice.framework.
 CDMS_DIR := /Library/Developer/PrivateFrameworks/CoreDevice.framework/Versions/A/Frameworks
 SRC := main.swift input.swift ax.swift hub.swift pasteboard.swift displays.swift devices.swift \
-	encoder.swift phone.swift phoneinput.swift wifi.swift hostpasteboard.swift
+	encoder.swift phone.swift phoneinput.swift phoneax.swift wifi.swift hostpasteboard.swift
 
 .PHONY: simcap clean
 
@@ -26,6 +26,21 @@ simcap:
 		-Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker res/Info.plist
 	@if [ -n "$(TEAM)" ]; then ./sign.sh $(TEAM) .build/simcap; \
 	else echo "simcap: signed ad hoc; each rebuild asks for the phone's camera again (make simcap TEAM=<team id> keeps the grant)"; fi
+
+# simcap-bridge: the Rust helper that reads a cabled iPhone's accessibility
+# tree over its own CoreDevice tunnel, since CoreDevice refuses its
+# remoteAXService to simcap. Built with cargo into .build/simcap-bridge, beside
+# simcap, where loupe looks for it. Needs Rust; simulator use does not, so this
+# is a separate target the simcap build does not depend on.
+#
+# Ad hoc signed here. Shipping in a notarized dmg needs it signed with the
+# hardened runtime under TEAM (its own identifier, not simcap's) -- not wired
+# yet.
+.PHONY: bridge
+bridge:
+	cargo build --release --manifest-path bridge/Cargo.toml
+	mkdir -p .build
+	cp bridge/target/release/simcap-bridge .build/simcap-bridge
 
 clean:
 	rm -rf .build

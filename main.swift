@@ -55,6 +55,9 @@ if args.first == "-devices" {
 if args == ["-hostpasteboard"] {
     runHostPasteboard()
 }
+if args.count == 3, args[1] == "-phone-ax-probe" {
+    runPhoneAXProbe(identifier: args[0], service: args[2])
+}
 if args.count == 2, args[1] == "-phone-input" {
     runPhoneInput(identifier: args[0])
 }
