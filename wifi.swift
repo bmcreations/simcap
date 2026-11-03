@@ -181,6 +181,9 @@ final class WifiReceiver {
     private var baseSeq = -1, maxSeq = 0, cycles = 0, received = 0
     private var lsr: UInt32 = 0, lsrAt: Date?
     private var lastPLI = Date.distantPast
+    private var firSeq: UInt8 = 0
+    private var askedAt: Date?        // the oldest unanswered keyframe ask
+    private var loggedAsk = Date.distantPast
 
     // Owned by the receive thread.
     private var depack = HEVCDepacketizer()
@@ -335,7 +338,10 @@ final class WifiReceiver {
             let start = t0
             let pts = (max(u.arrival, start) - start) / 1000
             passthrough.send(vps: vps, sps: sps, pps: pps, format: format, nals: picture, key: key, pts: pts)
-            if key { keys += 1 }
+            if key {
+                keys += 1
+                answered()
+            }
         }
         var block: CMBlockBuffer?
         let len = body.count
@@ -465,8 +471,9 @@ final class WifiReceiver {
         sendPLI()
     }
 
-    // sendPLI asks the phone for a keyframe (RFC 4585), at most five times a
-    // second. Whether the phone honours it is not yet known.
+    // sendPLI asks the phone for a keyframe, at most five times a second, as
+    // both a PLI (RFC 4585) and a FIR (RFC 5104): which of them the phone
+    // honours, if either, is what the ask and answer lines in the log find out.
     private func sendPLI() {
         lock.lock()
         guard let p = peer, remote != 0, me != 0, Date().timeIntervalSince(lastPLI) > 0.2 else {
@@ -474,9 +481,25 @@ final class WifiReceiver {
             return
         }
         lastPLI = Date()
-        let pkt: [UInt8] = [0x81, 206, 0, 2] + bytes32(me) + bytes32(remote)
+        if askedAt == nil { askedAt = lastPLI }
+        firSeq &+= 1
+        let pli: [UInt8] = [0x81, 206, 0, 2] + bytes32(me) + bytes32(remote)
+        let fir: [UInt8] = [0x84, 206, 0, 4] + bytes32(me) + bytes32(0) + bytes32(remote) + [firSeq, 0, 0, 0]
+        let logIt = lastPLI.timeIntervalSince(loggedAsk) > 2
+        if logIt { loggedAsk = lastPLI }
         lock.unlock()
-        send(pkt, to: p)
+        send(pli, to: p)
+        send(fir, to: p)
+        if logIt { log("wifi: asked the phone for a keyframe (PLI and FIR \(firSeq))") }
+    }
+
+    // answered logs how long the phone took to send a keyframe after an ask.
+    private func answered() {
+        lock.lock()
+        let at = askedAt
+        askedAt = nil
+        lock.unlock()
+        if let at { log("wifi: keyframe \(Int(Date().timeIntervalSince(at) * 1000))ms after the ask") }
     }
 
     private func send(_ pkt: [UInt8], to peer: sockaddr_in6) {
