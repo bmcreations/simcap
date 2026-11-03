@@ -283,6 +283,17 @@ final class WifiReceiver {
     }
 
     private var waiting = false
+    private var keyShape = ""
+
+    // noteKeyShape logs a keyframe's slice count, and whether parameter sets
+    // came with it, when that changes. A picture split into several slices is
+    // what a lost packet can leave half decoded.
+    private func noteKeyShape(_ u: HEVCDepacketizer.Unit) {
+        let types = u.nals.filter { $0.count >= 2 }.map { ($0[$0.startIndex] >> 1) & 0x3f }
+        let shape = "\(types.filter { $0 < 32 }.count) slice(s), parameter sets \(types.contains(33) ? "with it" : "not repeated")"
+        if shape != keyShape { log("wifi: keyframe: \(shape)") }
+        keyShape = shape
+    }
 
     // lose logs a failure once until the next picture decodes, and asks the
     // phone for a keyframe. The depacketiser already holds back what follows.
@@ -295,6 +306,7 @@ final class WifiReceiver {
     // decode decodes one whole access unit.
     private func decode(_ u: HEVCDepacketizer.Unit) {
         let key = u.key
+        if key { noteKeyShape(u) }
         var params = false
         var body = Data()
         var picture: [Data] = []
