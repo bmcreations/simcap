@@ -82,6 +82,45 @@ private func watchNegotiation(receiver: @escaping (String, UInt16) -> Void, ssrc
     return p
 }
 
+// MARK: - latency
+
+// LatencyLog is measurement only, on with SIMCAP_LATENCY=1. It logs t0 as wall
+// time once, so a client on this Mac can turn any PTS into a wall time, and
+// every 5s how long the H.264 track spends between an access unit's arrival
+// and its re-encode starting: the decode the passthrough skips. A PTS on the
+// H.264 track is stamped at that start, so a client measuring from PTS adds
+// this to get the same arrival reference the HEVC track's PTS has.
+final class LatencyLog {
+    private let lock = NSLock()
+    private var waits: [Double] = []
+
+    init() {
+        let start = t0
+        let now = DispatchTime.now().uptimeNanoseconds
+        let wall = Date().timeIntervalSince1970 * 1e6 - Double(now - start) / 1000
+        log("latency: t0 wall \(UInt64(wall)) us")
+        let timer = DispatchSource.makeTimerSource(queue: .global())
+        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.setEventHandler { [weak self] in self?.report() }
+        timer.resume()
+        _ = Unmanaged.passRetained(timer as AnyObject)
+    }
+
+    func note(_ arrived: UInt64) {
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - arrived) / 1e6
+        lock.withLock { waits.append(ms) }
+    }
+
+    private func report() {
+        let w = lock.withLock { () -> [Double] in defer { waits = [] }; return waits.sorted() }
+        guard !w.isEmpty else { return }
+        func p(_ q: Double) -> String { String(format: "%.1f", w[min(w.count - 1, Int(Double(w.count) * q))]) }
+        log("latency: arrival to H.264 encode n=\(w.count) p50 \(p(0.5))ms p90 \(p(0.9))ms max \(p(1))ms")
+    }
+}
+
+let latency: LatencyLog? = ProcessInfo.processInfo.environment["SIMCAP_LATENCY"] == "1" ? LatencyLog() : nil
+
 // MARK: - passthrough
 
 // HEVCPassthrough writes the phone's own access units to fd 3, in the wire
@@ -346,6 +385,7 @@ final class WifiReceiver {
         guard CMSampleBufferCreateReady(allocator: nil, dataBuffer: block, formatDescription: format, sampleCount: 1,
                                         sampleTimingEntryCount: 0, sampleTimingArray: nil, sampleSizeEntryCount: 1,
                                         sampleSizeArray: &size, sampleBufferOut: &sbuf) == noErr, let sbuf else { return }
+        let arrived = auArrival
         let st = VTDecompressionSessionDecodeFrame(decoder, sampleBuffer: sbuf, flags: [], infoFlagsOut: nil) { [weak self] st, _, pb, _, _ in
             guard let self else { return }
             if st != noErr || pb == nil {
@@ -358,7 +398,10 @@ final class WifiReceiver {
                     log("wifi: first picture \(CVPixelBufferGetWidth(pixels))x\(CVPixelBufferGetHeight(pixels))")
                 }
                 self.last = pixels
-                if DispatchTime.now().uptimeNanoseconds - lastEncode >= minGap { encodePixels(pixels, 0) }
+                if DispatchTime.now().uptimeNanoseconds - lastEncode >= minGap {
+                    latency?.note(arrived)
+                    encodePixels(pixels, 0)
+                }
             }
         }
         if st != noErr { lose("decode \(st)") }
