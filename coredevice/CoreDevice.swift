@@ -191,3 +191,17 @@ public struct VendorDefinedHIDCapability: DeviceCapability {
 extension CapabilityStaticMember where A == HIDDeviceCapability {
   public static var vendorDefined: CapabilityStaticMember<VendorDefinedHIDCapability> { fatalError() }
 }
+
+// A socket to a service on the device by its RemoteServiceDiscovery name,
+// through the CoreDevice tunnel. Xcode's Device Hub opens the phone's
+// accessibility service this way.
+public protocol CreateServiceSocketProtocol: DeviceCapabilityProtocol {
+  func fileHandle(toServiceNamed: String) async throws -> FileHandle
+}
+public struct CreateServiceSocketCapability: DeviceCapability {
+  public typealias ProtocolType = Any
+  public typealias ImplType = Any
+}
+extension CapabilityStaticMember where A: DeviceCapability {
+  public static var createServiceSocket: CapabilityStaticMember<CreateServiceSocketCapability> { fatalError() }
+}
