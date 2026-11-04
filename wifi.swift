@@ -24,6 +24,7 @@ import CoreDevice
 import CoreDeviceMediaStreamSupport
 import CoreMedia
 import Darwin
+import ObjectiveC
 import Foundation
 import QuartzCore
 import VideoToolbox
@@ -542,6 +543,7 @@ func runPhoneWifi(identifier: String, name: String) -> Never {
         pending.unlock()
     })
     _ = watcher
+    disableResolutionAdaptation()
 
     Task {
         guard let dev = await coreDevice(want) else { fail("CoreDevice does not list \(identifier)") }
@@ -583,4 +585,31 @@ func runPhoneWifi(identifier: String, name: String) -> Never {
     }
     startControl()
     dispatchMain()
+}
+
+// disableResolutionAdaptation takes VRAE out of the feature list simcap's
+// negotiator offers the phone. With it, the phone drops its encode size
+// while the screen moves and rescales its reference pictures to match;
+// avconferenced decodes that with private per-frame options, and every
+// standard HEVC decoder, VideoToolbox's included, smears from the first
+// reduced frame to the next keyframe.
+func disableResolutionAdaptation() {
+    _ = dlopen("/System/Library/PrivateFrameworks/AVConference.framework/AVConference", RTLD_NOW)
+    let sel = NSSelectorFromString("featureListString")
+    guard let cls = NSClassFromString("AVCMediaStreamNegotiatorSettingsCoreDeviceScreenSharing"),
+          let m = class_getInstanceMethod(cls, sel) else {
+        log("wifi: no negotiator settings class; resolution adaptation stays on")
+        return
+    }
+    typealias Getter = @convention(c) (AnyObject, Selector) -> AnyObject?
+    let orig = unsafeBitCast(method_getImplementation(m), to: Getter.self)
+    var logged = false
+    let patched: @convention(block) (AnyObject) -> AnyObject? = { me in
+        guard let list = orig(me, sel) as? [AnyHashable: Any] else { return orig(me, sel) }
+        var out = [AnyHashable: Any]()
+        for (k, v) in list { out[k] = (v as? String)?.replacingOccurrences(of: "VRAE:0;", with: "") ?? v }
+        if !logged { logged = true; log("wifi: offering features \(out)") }
+        return out as NSDictionary
+    }
+    method_setImplementation(m, imp_implementationWithBlock(patched))
 }
