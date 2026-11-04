@@ -170,7 +170,7 @@ final class HubHID {
         case .up: .end
         }
         try digitizer.send(pointOne: DigitizerPoint(x: x, y: y), pointTwo: nil, eventType: type, edge: .none, target: digitizerTarget())
-        digitizer.sendBarrier()
+        barrier(phase)
     }
 
     // Two fingers in one event, which is what pinch and two-finger rotate
@@ -183,7 +183,17 @@ final class HubHID {
         }
         try digitizer.send(pointOne: DigitizerPoint(x: x0, y: y0), pointTwo: DigitizerPoint(x: x1, y: y1),
                            eventType: type, edge: .none, target: digitizerTarget())
-        digitizer.sendBarrier()
+        barrier(phase)
+    }
+
+    // barrier waits for a down or an up to reach the device, but not a move.
+    // On a phone over Wi-Fi the wait is about 30ms, and a viewer sends a move
+    // every 8 to 16ms, so waiting on each one queued the drag behind itself:
+    // the page trailed the finger and iOS saw a slow finger at the lift, so
+    // the fling was weak. A 50-step swipe on a phone over Wi-Fi took 2.83s
+    // with the wait on every move and 1.43s without it.
+    private func barrier(_ phase: TouchPhase) {
+        if phase != .move { digitizer.sendBarrier() }
     }
 }
 
