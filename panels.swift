@@ -25,9 +25,10 @@ struct LitDisplay: Equatable {
 // Settings' upright position, (1500,264), opened it. scale is pixels per point, which the accessibility tree
 // needs because its root reports the outer panel even while the inner is lit.
 // width and height are the framebuffer's, which is how a surface is matched
-// to its panel: 1398x2034 and 2007x2853 on the Duo.
+// to its panel: 1398x2034 and 2007x2853 on the Duo. id is its screenID,
+// which a touch is aimed at.
 struct PanelSpec {
-    var turn: Int, scale: Double, width: Int = 0, height: Int = 0
+    var turn: Int, scale: Double, width: Int = 0, height: Int = 0, id: UInt32 = 0
 }
 
 // Candidate is one framebuffer surface: its size, and whether it is solid
@@ -52,23 +53,31 @@ let litHoldNanos: UInt64 = 1_500_000_000
 // with a picture: the hidden panel is solid black, so a picture there means
 // it has lit, and CoreDevice says so about 200ms later. A dark app on the
 // lit panel leaves the other one black and keeps its place.
+//
+// id is the chosen panel's screenID, which input aims a touch at, or 0 when
+// nothing names one (a phone before CoreDevice answers). A touch aimed by
+// CoreDevice's lit panel instead landed on the old panel for up to 200ms
+// after the new one showed.
 func chooseSurface(_ cands: [Candidate], panels: Int, lit: LitDisplay?, lastLit: LitDisplay?,
-                   unknownFor: UInt64, specs: [PanelSpec]) -> (index: Int, turn: Int)? {
+                   unknownFor: UInt64, specs: [PanelSpec]) -> (index: Int, turn: Int, id: UInt32)? {
     func match(_ d: LitDisplay) -> Int? { cands.firstIndex { $0.width == d.width && $0.height == d.height } }
     func area(_ i: Int) -> Int { cands[i].width * cands[i].height }
     guard let largest = cands.indices.max(by: { area($0) < area($1) }) else { return nil }
-    guard panels >= 2 else { return lit.flatMap(match).map { ($0, lit!.turn) } ?? (largest, 0) }
+    guard panels >= 2 else {
+        if let lit, let i = match(lit) { return (i, lit.turn, lit.id) }
+        return (largest, 0, lit?.id ?? 0)
+    }
     func spec(_ i: Int) -> PanelSpec? { specs.first { $0.width == cands[i].width && $0.height == cands[i].height } }
+    func bySpec(_ i: Int) -> (index: Int, turn: Int, id: UInt32) { (i, spec(i)?.turn ?? 0, spec(i)?.id ?? 0) }
     let panelIdx = cands.indices.filter { spec($0) != nil }
-    var pick: (index: Int, turn: Int)?
-    if let lit, let i = match(lit) { pick = (i, lit.turn) }
-    else if let lastLit, unknownFor < litHoldNanos, let i = match(lastLit) { pick = (i, lastLit.turn) }
+    var pick: (index: Int, turn: Int, id: UInt32)?
+    if let lit, let i = match(lit) { pick = (i, lit.turn, lit.id) }
+    else if let lastLit, unknownFor < litHoldNanos, let i = match(lastLit) { pick = (i, lastLit.turn, lastLit.id) }
     if let p = pick, !cands[p.index].black() { return p }
     let others = panelIdx.filter { $0 != pick?.index && !cands[$0].black() }
-    if others.count == 1 { return (others[0], spec(others[0])?.turn ?? 0) }
+    if others.count == 1 { return bySpec(others[0]) }
     if let pick { return pick }
-    let guess = panelIdx.max(by: { area($0) < area($1) }) ?? largest
-    return (guess, spec(guess)?.turn ?? 0)
+    return bySpec(panelIdx.max(by: { area($0) < area($1) }) ?? largest)
 }
 
 // blackSkipNanos caps how long black frames are held back after a switch, so

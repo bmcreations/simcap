@@ -44,7 +44,7 @@ func loadPanelSpecs(device: NSObject) {
         let rot = (d["nativeRotation"] as? NSNumber)?.intValue ?? 0
         let spec = PanelSpec(turn: (360 - rot % 360) % 360, scale: (d["scale"] as? NSNumber)?.doubleValue ?? 0,
                                    width: (d["width"] as? NSNumber)?.intValue ?? 0,
-                                   height: (d["height"] as? NSNumber)?.intValue ?? 0)
+                                   height: (d["height"] as? NSNumber)?.intValue ?? 0, id: id)
         panelSpecs[id] = spec
         if d["chromeIdentifier"] != nil { builtInSpecs.append(spec) }
     }

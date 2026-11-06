@@ -149,10 +149,11 @@ private func setHardwareKeyboard(_ device: NSObject, _ on: Bool) throws {
     if !ok.boolValue { throw InputError("hwkeyboard: \(err?.localizedDescription ?? "refused")") }
 }
 
-// screen is the lit framebuffer's width and height and its clockwise turn to
-// upright. Coordinates arrive on the upright screen, the space the video,
-// simctl's screenshot and the accessibility tree share.
-func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int, Int)) -> Never {
+// screen is the streamed framebuffer's width and height, its clockwise turn
+// to upright, and its panel's screenID, which a touch is aimed at (0 for the
+// main screen). Coordinates arrive on the upright screen, the space the
+// video, simctl's screenshot and the accessibility tree share.
+func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int, Int, UInt32)) -> Never {
     // Everything that builds a message runs on the main thread: the mouse
     // builder reads AppKit's per-thread state, and off the main thread the
     // simulator drops what it builds without a word.
@@ -160,17 +161,27 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
     log("input ready")
 
     // norm maps an upright point to one normalised to the framebuffer, and
-    // returns the framebuffer's size beside it.
-    func norm(_ x: Double, _ y: Double) throws -> (Double, Double, Double, Double) {
-        let (w, h, t) = screen()
+    // returns the framebuffer's size and panel beside it. The panel is the
+    // one capture would stream now (chooseSurface), probed at the touch, so
+    // through a fold a touch follows the picture rather than CoreDevice's
+    // lit panel, which names the new one up to 200ms later.
+    func norm(_ x: Double, _ y: Double) throws -> (Double, Double, Double, Double, UInt32) {
+        let (w, h, t, id) = screen()
         guard w > 0, h > 0 else { throw InputError("no framebuffer") }
         let (uw, uh) = turned(w, h, t)
         let (px, py) = panelNorm(min(max(x / Double(uw), 0), 1), min(max(y / Double(uh), 0), 1), t)
-        return (px, py, Double(w), Double(h))
+        return (px, py, Double(w), Double(h), id)
+    }
+
+    // aheadOfLit logs a touch-down aimed at a panel CoreDevice does not yet
+    // name, the case this choice exists for.
+    func aheadOfLit(_ id: UInt32) {
+        guard panelCount() >= 2, let lit = litDisplay()?.id, lit != id else { return }
+        log("input: touch on panel \(id) while CoreDevice names \(lit)")
     }
 
     // Touch, tap and swipe, the same through either client.
-    func gesture(_ f: [Substring], _ touch: (TouchPhase, Double, Double, Double, Double) throws -> Void) throws -> Bool {
+    func gesture(_ f: [Substring], _ touch: (TouchPhase, Double, Double, Double, Double, UInt32) throws -> Void) throws -> Bool {
         func num(_ i: Int) throws -> Double {
             guard i < f.count, let v = Double(f[i]) else { throw InputError("\(f[0]): argument \(i) is not a number") }
             return v
@@ -185,25 +196,29 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
             case "up": phase = .up
             default: throw InputError("touch phase \(f[1])")
             }
-            let (x, y, w, h) = try norm(try num(2), try num(3))
-            try touch(phase, x, y, w, h)
+            let (x, y, w, h, id) = try norm(try num(2), try num(3))
+            if phase == .down { aheadOfLit(id) }
+            try touch(phase, x, y, w, h, id)
         case "tap":
-            let (x, y, w, h) = try norm(try num(1), try num(2))
-            try touch(.down, x, y, w, h)
+            let (x, y, w, h, id) = try norm(try num(1), try num(2))
+            aheadOfLit(id)
+            try touch(.down, x, y, w, h, id)
             usleep(60_000)
-            try touch(.up, x, y, w, h)
+            try touch(.up, x, y, w, h, id)
         case "swipe":
-            let (x0, y0, w, h) = try norm(try num(1), try num(2))
-            let (x1, y1, _, _) = try norm(try num(3), try num(4))
+            // One panel for the whole swipe, the one under its start.
+            let (x0, y0, w, h, id) = try norm(try num(1), try num(2))
+            let (x1, y1, _, _, _) = try norm(try num(3), try num(4))
+            aheadOfLit(id)
             let ms = max(try num(5), 16)
             let steps = max(Int(ms / 16), 1)
-            try touch(.down, x0, y0, w, h)
+            try touch(.down, x0, y0, w, h, id)
             for i in 1...steps {
                 usleep(useconds_t(ms * 1000 / Double(steps)))
                 let t = Double(i) / Double(steps)
-                try touch(.move, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, w, h)
+                try touch(.move, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, w, h, id)
             }
-            try touch(.up, x1, y1, w, h)
+            try touch(.up, x1, y1, w, h, id)
         default:
             return false
         }
@@ -215,10 +230,11 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
             guard i < f.count, let v = Double(f[i]) else { throw InputError("\(f[0]): argument \(i) is not a number") }
             return v
         }
-        if try gesture(f, hid.touch) { return "ok" }
+        // The legacy client has one digitizer target and ignores the panel.
+        if try gesture(f, { p, x, y, w, h, _ in try hid.touch(p, x, y, w, h) }) { return "ok" }
         switch f[0] {
         case "size":
-            let (w, h, t) = screen()
+            let (w, h, t, _) = screen()
             let (uw, uh) = turned(w, h, t)
             return "ok \(uw) \(uh)"
         case "display":
@@ -318,9 +334,10 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
             case "up": phase = .up
             default: throw InputError("touch2 phase \(f[1])")
             }
-            let (x0, y0, _, _) = try norm(try num(2), try num(3))
-            let (x1, y1, _, _) = try norm(try num(4), try num(5))
-            try h.touch2(phase, x0, y0, x1, y1)
+            let (x0, y0, _, _, id) = try norm(try num(2), try num(3))
+            let (x1, y1, _, _, _) = try norm(try num(4), try num(5))
+            if phase == .down { aheadOfLit(id) }
+            try h.touch2(phase, x0, y0, x1, y1, panel: id)
         case "hinge":
             guard f.count == 2, let deg = Double(f[1]) else { throw InputError("hinge DEGREES") }
             try h.hinge(deg)
@@ -330,19 +347,21 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
             let (cx, cy, from, to) = (try num(1), try num(2), try num(3) / 2, try num(4) / 2)
             let ms = max(try num(5), 16)
             let steps = max(Int(ms / 16), 1)
+            let id = try norm(cx, cy).4
+            aheadOfLit(id)
             func at(_ r: Double) throws -> (Double, Double, Double, Double) {
-                let (x0, y0, _, _) = try norm(cx - r, cy)
-                let (x1, y1, _, _) = try norm(cx + r, cy)
+                let (x0, y0, _, _, _) = try norm(cx - r, cy)
+                let (x1, y1, _, _, _) = try norm(cx + r, cy)
                 return (x0, y0, x1, y1)
             }
             var p = try at(from)
-            try h.touch2(.down, p.0, p.1, p.2, p.3)
+            try h.touch2(.down, p.0, p.1, p.2, p.3, panel: id)
             for i in 1...steps {
                 usleep(useconds_t(ms * 1000 / Double(steps)))
                 p = try at(from + (to - from) * Double(i) / Double(steps))
-                try h.touch2(.move, p.0, p.1, p.2, p.3)
+                try h.touch2(.move, p.0, p.1, p.2, p.3, panel: id)
             }
-            try h.touch2(.up, p.0, p.1, p.2, p.3)
+            try h.touch2(.up, p.0, p.1, p.2, p.3, panel: id)
         default:
             return false
         }
@@ -356,7 +375,7 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
             guard i < f.count, let v = UInt32(f[i]) else { throw InputError("\(f[0]): argument \(i) is not a number") }
             return v
         }
-        if try gesture(f, { p, x, y, _, _ in try h.touch(p, x, y) }) { return }
+        if try gesture(f, { p, x, y, _, _, id in try h.touch(p, x, y, panel: id) }) { return }
         if try twoFinger(f, h) { return }
         switch f[0] {
         case "button":

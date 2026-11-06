@@ -10,8 +10,8 @@ func check(_ ok: Bool, _ what: @autoclosure () -> String, line: Int = #line) {
 
 let cover = LitDisplay(width: 1398, height: 2034, id: 1, turn: 0)
 let inner = LitDisplay(width: 2007, height: 2853, id: 3, turn: 90)
-let duoSpecs = [PanelSpec(turn: 0, scale: 3, width: 1398, height: 2034),
-                PanelSpec(turn: 90, scale: 3, width: 2007, height: 2853)]
+let duoSpecs = [PanelSpec(turn: 0, scale: 3, width: 1398, height: 2034, id: 1),
+                PanelSpec(turn: 90, scale: 3, width: 2007, height: 2853, id: 3)]
 let ms: UInt64 = 1_000_000
 
 // duo is the Duo's two surfaces, inner first as CoreSimulator lists them.
@@ -21,9 +21,9 @@ func duo(innerBlack: Bool = false, coverBlack: Bool = false) -> [Candidate] {
 }
 
 func pick(_ c: [Candidate], panels: Int = 2, lit: LitDisplay?, last: LitDisplay?, unknownFor: UInt64 = 0)
-    -> (w: Int, h: Int, turn: Int)? {
+    -> (w: Int, h: Int, turn: Int, id: UInt32)? {
     chooseSurface(c, panels: panels, lit: lit, lastLit: last, unknownFor: unknownFor, specs: duoSpecs)
-        .map { (c[$0.index].width, c[$0.index].height, $0.turn) }
+        .map { (c[$0.index].width, c[$0.index].height, $0.turn, $0.id) }
 }
 
 @main
@@ -73,7 +73,20 @@ struct PanelsTests {
         // One panel: the largest surface, unturned, as before.
         let phone = [Candidate(width: 720, height: 480), Candidate(width: 1206, height: 2622)]
         let one = chooseSurface(phone, panels: 1, lit: nil, lastLit: nil, unknownFor: 0, specs: [])
-        check(one?.index == 1 && one?.turn == 0, "one panel: \(String(describing: one))")
+        check(one?.index == 1 && one?.turn == 0 && one?.id == 0, "one panel: \(String(describing: one))")
+        let phoneLit = LitDisplay(width: 1206, height: 2622, id: 1)
+        let oneLit = chooseSurface(phone, panels: 1, lit: phoneLit, lastLit: nil, unknownFor: 0, specs: [])
+        check(oneLit?.index == 1 && oneLit?.id == 1, "one panel, lit: \(String(describing: oneLit))")
+
+        // The panel a touch is aimed at is the one streamed, not the one
+        // CoreDevice names: each case above, by id.
+        check(pick(duo(), lit: inner, last: cover)?.id == 3, "lit inner id")
+        check(pick(duo(), lit: cover, last: inner)?.id == 1, "lit cover id")
+        check(pick(duo(coverBlack: true), lit: cover, last: cover)?.id == 3, "stale lit cover, inner lit: id")
+        check(pick(duo(innerBlack: true), lit: inner, last: inner)?.id == 1, "stale lit inner, cover lit: id")
+        check(pick(duo(innerBlack: true), lit: nil, last: inner, unknownFor: 100 * ms)?.id == 1, "held inner black, cover lit: id")
+        check(pick(duo(innerBlack: true, coverBlack: true), lit: nil, last: cover, unknownFor: 100 * ms)?.id == 1, "both black, hold cover: id")
+        check(pick(duo(innerBlack: true, coverBlack: true), lit: nil, last: cover, unknownFor: 3000 * ms)?.id == 3, "both black, guess: id")
         check(chooseSurface([], panels: 2, lit: nil, lastLit: cover, unknownFor: 0, specs: duoSpecs) == nil, "no surfaces")
 
         // Black frames are held back for under 350ms of a switch, then pass.

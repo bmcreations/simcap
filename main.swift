@@ -195,8 +195,10 @@ guard !descriptors.isEmpty else { fail("no framebuffer display port") }
 // others are overlays or external displays. turn is how far the surface is
 // turned clockwise to stand upright. On a foldable, chooseSurface
 // (panels.swift) holds the last lit panel while CoreDevice names none, so a
-// fold never streams a panel unturned.
-func currentSurface() -> (surf: IOSurface, turn: Int)? {
+// fold never streams a panel unturned. id is the chosen panel's screenID,
+// which input aims each touch at, so a touch lands on the panel the stream
+// shows rather than the one CoreDevice last named.
+func currentSurface() -> (surf: IOSurface, turn: Int, id: UInt32)? {
     let surfs: [IOSurface] = descriptors.compactMap { d in
         d.perform(NSSelectorFromString("framebufferSurface")).map { unsafeBitCast($0.takeUnretainedValue(), to: IOSurface.self) }
     }
@@ -205,7 +207,7 @@ func currentSurface() -> (surf: IOSurface, turn: Int)? {
     guard let pick = chooseSurface(cands, panels: panelCount(), lit: h.lit, lastLit: h.last,
                                    unknownFor: h.unknownFor, specs: panelSpecsBuiltIn())
     else { return nil }
-    return (surfs[pick.index], pick.turn)
+    return (surfs[pick.index], pick.turn, pick.id)
 }
 
 // surfaceIsBlack reads a 32-bit surface read-only and says whether it is
@@ -223,8 +225,8 @@ streamName = deviceName
 
 if inputMode {
     runInput(device: device, udid: udid) {
-        guard let s = currentSurface() else { return (0, 0, 0) }
-        return (s.surf.width, s.surf.height, s.turn)
+        guard let s = currentSurface() else { return (0, 0, 0, 0) }
+        return (s.surf.width, s.surf.height, s.turn, s.id)
     }
 }
 
