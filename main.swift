@@ -193,18 +193,29 @@ guard !descriptors.isEmpty else { fail("no framebuffer display port") }
 // The main display is the lit one where CoreDevice says which that is (see
 // displays.swift), and otherwise the largest surface. A phone has one; the
 // others are overlays or external displays. turn is how far the surface is
-// turned clockwise to stand upright, which only the lit panel can know.
+// turned clockwise to stand upright. On a foldable, chooseSurface
+// (panels.swift) holds the last lit panel while CoreDevice names none, so a
+// fold never streams a panel unturned.
 func currentSurface() -> (surf: IOSurface, turn: Int)? {
-    var best: IOSurface?
-    let lit = litDisplay()
-    for d in descriptors {
-        guard let s = d.perform(NSSelectorFromString("framebufferSurface"))?.takeUnretainedValue() else { continue }
-        let surf = unsafeBitCast(s, to: IOSurface.self)
-        if let lit, surf.width == lit.width, surf.height == lit.height { return (surf, lit.turn) }
-        if best == nil || surf.width * surf.height > best!.width * best!.height { best = surf }
+    let surfs: [IOSurface] = descriptors.compactMap { d in
+        d.perform(NSSelectorFromString("framebufferSurface")).map { unsafeBitCast($0.takeUnretainedValue(), to: IOSurface.self) }
     }
-    return best.map { ($0, 0) }
+    let h = litHistory()
+    let cands = surfs.map { s in Candidate(width: s.width, height: s.height, black: { surfaceIsBlack(s) }) }
+    guard let pick = chooseSurface(cands, panels: panelCount(), lit: h.lit, lastLit: h.last,
+                                   unknownFor: h.unknownFor, specs: panelSpecsBuiltIn())
+    else { return nil }
+    return (surfs[pick.index], pick.turn)
 }
+
+// surfaceIsBlack reads a 32-bit surface read-only and says whether it is
+// solid black. Any other format reads as not black.
+func surfaceIsBlack(_ s: IOSurface) -> Bool {
+    guard s.bytesPerElement == 4, s.lock(options: .readOnly, seed: nil) == kIOReturnSuccess else { return false }
+    defer { s.unlock(options: .readOnly, seed: nil) }
+    return isSolidBlack(s.baseAddress, width: s.width, height: s.height, bytesPerRow: s.bytesPerRow)
+}
+
 loadPanelSpecs(device: device)
 watchLitDisplay(udid: udid)
 
@@ -215,6 +226,32 @@ if inputMode {
         guard let s = currentSurface() else { return (0, 0, 0) }
         return (s.surf.width, s.surf.height, s.turn)
     }
+}
+
+// On a foldable, black frames are held back for up to 350ms from a switch
+// (panels.swift), so the viewer keeps the old panel's picture instead of a
+// black keyframe while the new one lights. A switch is a change in the lit
+// panel or the streamed surface, or the streamed surface going black, which
+// is the first sign of a fold this process sees: the hinge write lands in
+// the input process. Only a change of surface restarts an open window.
+var lastStreamed: (surf: IOSurface, black: Bool)?
+var skipWindow: UInt64?
+var lastLitSeen: LitDisplay?
+func holdBlack(_ surf: IOSurface) -> Bool {
+    guard panelCount() >= 2 else { return false }
+    let now = DispatchTime.now().uptimeNanoseconds
+    let black = surfaceIsBlack(surf)
+    let lit = litDisplay()
+    let moved = lastStreamed.map { $0.surf.width != surf.width || $0.surf.height != surf.height } ?? false
+    if moved {
+        skipWindow = now
+    } else if lit != lastLitSeen || (black && lastStreamed?.black == false) {
+        if skipWindow.map({ now - $0 >= blackSkipNanos }) ?? true { skipWindow = now }
+    }
+    if black && lastStreamed?.black == false { pollLitFast() }
+    lastLitSeen = lit
+    lastStreamed = (surf, black)
+    return skipBlack(black, windowStart: skipWindow, now: now)
 }
 
 // Coalesces composite callbacks: at most one capture is queued, and captures
@@ -228,7 +265,7 @@ func schedule() {
         let wait = lastEncode + minGap > now ? lastEncode + minGap - now : 0
         encodeQueue.asyncAfter(deadline: .now() + .nanoseconds(Int(wait))) {
             pending = false
-            autoreleasepool { if let s = currentSurface() { encode(s.surf, s.turn) } }
+            autoreleasepool { if let s = currentSurface(), !holdBlack(s.surf) { encode(s.surf, s.turn) } }
         }
     }
 }
@@ -247,15 +284,23 @@ for d in descriptors where d.responds(to: register) {
 
 // The idle floor: a static screen composites nothing, so re-encode what is
 // there every 250ms. That is what gets a frame out at startup and keeps the
-// keyframe interval honest on a screen nobody is touching.
+// keyframe interval honest on a screen nobody is touching. A panel lighting
+// on a fold composites nothing either, so on a foldable the floor drops to
+// 50ms while pollLitFast's window is open, and the new panel is seen as soon
+// as it lights rather than up to 250ms later. Between folds it still looks
+// every 50ms for the streamed panel going black, the first sign of one,
+// without encoding.
 let idle = DispatchSource.makeTimerSource(queue: encodeQueue)
-idle.schedule(deadline: .now(), repeating: .milliseconds(250))
+idle.schedule(deadline: .now(), repeating: .milliseconds(panelCount() >= 2 ? 50 : 250))
 idle.setEventHandler {
-    if DispatchTime.now().uptimeNanoseconds - lastEncode >= 250_000_000 { schedule() }
+    let floor: UInt64 = litPollingFast() ? 50_000_000 : 250_000_000
+    if DispatchTime.now().uptimeNanoseconds - lastEncode >= floor { schedule(); return }
+    if panelCount() >= 2, lastStreamed?.black == false, let s = currentSurface(), surfaceIsBlack(s.surf) { schedule() }
 }
 idle.resume()
 
 onKeyRequest = schedule
+onLitChange = schedule
 startControl()
 
 dispatchMain()

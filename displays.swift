@@ -14,24 +14,7 @@
 import CoreDevice
 import Foundation
 
-// LitDisplay is the panel in use. id is CoreDevice's displayId, which is
-// also simctl's screen ID: on loupe-duo the outer panel is 1 and the inner 3.
-// width and height are the framebuffer's, and turn is how far it is turned
-// clockwise to stand upright (see PanelSpec).
-struct LitDisplay: Equatable {
-    var width: Int, height: Int, id: UInt32, turn: Int = 0
-}
-
-// PanelSpec is what the device type declares about one display. The Duo's
-// inner panel has a nativeRotation of 270: its framebuffer is 2007x2853 while
-// the Home Screen on it is landscape, and simctl's screenshot of it is
-// 2853x2007. The picture is the framebuffer turned a quarter clockwise: the
-// stream turned that way showed the Home Screen upright, and a tap at
-// Settings' upright position, (1500,264), opened it. scale is pixels per point, which the accessibility tree
-// needs because its root reports the outer panel even while the inner is lit.
-struct PanelSpec {
-    var turn: Int, scale: Double
-}
+// LitDisplay and PanelSpec are in panels.swift.
 
 private var panelSpecs: [UInt32: PanelSpec] = [:]
 
@@ -49,6 +32,7 @@ func loadPanelSpecs(device: NSObject) {
     else { return }
     let builtIn = displays.filter { $0["chromeIdentifier"] != nil }
     builtInPanels = builtIn.count
+    builtInSpecs = []
     func area(_ d: [String: Any]) -> Double {
         ((d["width"] as? NSNumber)?.doubleValue ?? 0) * ((d["height"] as? NSNumber)?.doubleValue ?? 0)
     }
@@ -58,11 +42,20 @@ func loadPanelSpecs(device: NSObject) {
     for d in displays {
         guard let id = (d["screenID"] as? NSNumber)?.uint32Value else { continue }
         let rot = (d["nativeRotation"] as? NSNumber)?.intValue ?? 0
-        panelSpecs[id] = PanelSpec(turn: (360 - rot % 360) % 360, scale: (d["scale"] as? NSNumber)?.doubleValue ?? 0)
+        let spec = PanelSpec(turn: (360 - rot % 360) % 360, scale: (d["scale"] as? NSNumber)?.doubleValue ?? 0,
+                                   width: (d["width"] as? NSNumber)?.intValue ?? 0,
+                                   height: (d["height"] as? NSNumber)?.intValue ?? 0)
+        panelSpecs[id] = spec
+        if d["chromeIdentifier"] != nil { builtInSpecs.append(spec) }
     }
 }
 
 func panelSpec(_ id: UInt32) -> PanelSpec? { panelSpecs[id] }
+
+// builtInSpecs are the specs of the panels that name a chrome, matched to
+// surfaces by size when CoreDevice names no lit one.
+private var builtInSpecs: [PanelSpec] = []
+func panelSpecsBuiltIn() -> [PanelSpec] { builtInSpecs }
 
 // panelCount is how many built-in panels the device type declares: two on
 // the iPhone Duo, which is what makes it foldable here, and one on an iPhone
@@ -97,6 +90,37 @@ func panelNorm(_ x: Double, _ y: Double, _ t: Int) -> (Double, Double) {
 
 private let activeLock = NSLock()
 private var active: LitDisplay?
+private var lastActive: LitDisplay?      // the last panel CoreDevice named
+private var unknownSince: UInt64 = 0     // uptime ns when it stopped naming one
+private var fastUntil: UInt64 = 0        // poll every 50ms until this uptime
+
+// onLitChange runs on the poller when the lit panel changes, so a capture
+// does not wait for its idle timer to show the new one.
+nonisolated(unsafe) var onLitChange: () -> Void = {}
+
+// litHistory is the lit panel, the last one named, and how long none has
+// been, for chooseSurface.
+func litHistory() -> (lit: LitDisplay?, last: LitDisplay?, unknownFor: UInt64) {
+    activeLock.lock(); defer { activeLock.unlock() }
+    let now = DispatchTime.now().uptimeNanoseconds
+    return (active, lastActive, active == nil && now > unknownSince ? now - unknownSince : 0)
+}
+
+// pollLitFast polls the lit panel every 50ms for the next two seconds: after
+// a hinge write, a change in the lit panel, or the streamed panel going
+// black, any of which can mean a fold is under way.
+func pollLitFast() {
+    activeLock.lock(); defer { activeLock.unlock() }
+    fastUntil = DispatchTime.now().uptimeNanoseconds + 2_000_000_000
+}
+
+// litPollingFast says whether pollLitFast's window is open.
+func litPollingFast() -> Bool { pollingFast() }
+
+private func pollingFast() -> Bool {
+    activeLock.lock(); defer { activeLock.unlock() }
+    return DispatchTime.now().uptimeNanoseconds < fastUntil
+}
 
 // litDisplay is the lit panel, or nil when CoreDevice has not answered or
 // no single panel is lit.
@@ -112,11 +136,13 @@ func litSize() -> (Int, Int)? {
 
 private func setLit(_ lit: LitDisplay?) {
     activeLock.lock(); defer { activeLock.unlock() }
+    if lit == nil, active != nil { unknownSince = DispatchTime.now().uptimeNanoseconds }
+    if let lit { lastActive = lit }
     active = lit
 }
 
-// watchLitDisplay polls CoreDevice for the lit panel every half second, and
-// logs each change. It waits up to a second for the first answer, so a folded
+// watchLitDisplay polls CoreDevice for the lit panel every half second, or
+// every 50ms after pollLitFast, and logs each change. It waits up to a second for the first answer, so a folded
 // Duo does not open on the black inner panel and then switch. Without
 // CoreDevice it does nothing and the largest surface is streamed, as before.
 //
@@ -178,7 +204,14 @@ private func pollLit(_ dev: RemoteDevice, _ first: DispatchSemaphore) async {
         if lit != last {
             log("displays: lit \(lit.map { "\($0.width)x\($0.height) id \($0.id) turn \($0.turn)" } ?? "unknown")")
             last = lit
+            pollLitFast()
+            onLitChange()
         }
-        try? await Task.sleep(nanoseconds: 500_000_000)
+        // In 50ms steps, so a pollLitFast during the wait is not held for
+        // the rest of the half second.
+        for _ in 0..<10 {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            if pollingFast() { break }
+        }
     }
 }

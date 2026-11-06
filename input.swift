@@ -298,7 +298,7 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
             case .failure(let e): return "err hinge needs CoreDevice, which did not open: \(e)"
             }
         }
-        do { try hingeOnly!.set(deg); return "ok" } catch { return "err \(error)" }
+        do { try hingeOnly!.set(deg); pollLitFast(); return "ok" } catch { return "err \(error)" }
     }
 
     // Two-finger gestures exist only on the CoreDevice route: the legacy
@@ -324,6 +324,7 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
         case "hinge":
             guard f.count == 2, let deg = Double(f[1]) else { throw InputError("hinge DEGREES") }
             try h.hinge(deg)
+            pollLitFast()
         case "pinch":
             guard f.count == 6 else { throw InputError("pinch X Y FROM TO MS") }
             let (cx, cy, from, to) = (try num(1), try num(2), try num(3) / 2, try num(4) / 2)
