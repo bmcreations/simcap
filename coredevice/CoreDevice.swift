@@ -202,6 +202,35 @@ public struct CreateServiceSocketCapability: DeviceCapability {
   public typealias ProtocolType = Any
   public typealias ImplType = Any
 }
+
+// Orientation control, which Device Hub's rotate buttons use. The enums and
+// OrientationInfo are exported by CoreDeviceUtilities under this module's
+// name, like the keyboard types.
+public enum DeviceOrientation: String, CaseIterable {
+  case unknown, portrait, portraitUpsideDown, landscapeLeft, landscapeRight, faceUp, faceDown
+}
+
+public enum DeviceOrientationRotationDirection: String {
+  case left, right
+}
+
+public struct OrientationInfo: CustomStringConvertible {
+  public var currentDeviceOrientation: DeviceOrientation { fatalError() }
+  public var currentDeviceNonFlatOrientation: DeviceOrientation { fatalError() }
+  public var currentDeviceOrientationLocked: Bool { fatalError() }
+  public var description: String { fatalError() }
+}
+
+public protocol OrientationControl: DeviceCapabilityProtocol {
+  func changeDeviceOrientation(_ orientation: DeviceOrientation) async throws -> OrientationInfo
+  func currentDeviceOrientation() async throws -> OrientationInfo
+  func rotate(direction: DeviceOrientationRotationDirection) async throws -> OrientationInfo
+}
+public struct OrientationControlCapability: DeviceCapability {
+  public typealias ProtocolType = Any
+  public typealias ImplType = Any
+}
 extension CapabilityStaticMember where A: DeviceCapability {
   public static var createServiceSocket: CapabilityStaticMember<CreateServiceSocketCapability> { fatalError() }
+  public static var orientationControl: CapabilityStaticMember<OrientationControlCapability> { fatalError() }
 }

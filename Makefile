@@ -3,7 +3,7 @@
 # CoreDeviceMediaStreamSupport, which -phone-wifi negotiates through, ships
 # nested inside CoreDevice.framework.
 CDMS_DIR := /Library/Developer/PrivateFrameworks/CoreDevice.framework/Versions/A/Frameworks
-SRC := main.swift input.swift ax.swift hub.swift pasteboard.swift displays.swift devices.swift \
+SRC := main.swift input.swift ax.swift hub.swift orientation.swift pasteboard.swift displays.swift devices.swift \
 	encoder.swift phone.swift phoneinput.swift phoneax.swift wifi.swift rtp.swift hostpasteboard.swift panels.swift
 
 .PHONY: simcap clean test

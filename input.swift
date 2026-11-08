@@ -19,6 +19,8 @@
 //   keydown USAGE | keyup USAGE
 //   size                       -> ok W H
 //   ui                         -> ok {json}, the accessibility tree (ax.swift)
+//   orient get|set NAME|rotate left|right   -> ok NAME locked|unlocked
+//                              (orientation.swift)
 //   hwkeyboard on|off          connect or disconnect the hardware keyboard,
 //                              which hides or restores the on-screen one
 //
@@ -403,6 +405,7 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
     }
 
     var pasteboard: Result<HubPasteboard, InputError>?
+    var orientation: HubOrientation?
     Thread.detachNewThread {
         while let line = readLine() {
             let f = line.split(separator: " ")
@@ -414,6 +417,21 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
                 } else if case .failure(let e) = hub! {
                     reply = "ok legacy \(e)"
                 }
+                writeReply(reply)
+                continue
+            }
+            // Orientation has its own CoreDevice capability, opened on first
+            // use and kept; a failed open is retried on the next command.
+            if f[0] == "orient" {
+                do {
+                    if orientation == nil {
+                        switch HubOrientation.open(udid: udid) {
+                        case .success(let o): orientation = o
+                        case .failure(let e): throw e
+                        }
+                    }
+                    reply = "ok " + (try orientation!.handle(f))
+                } catch { reply = "err \(error)" }
                 writeReply(reply)
                 continue
             }
