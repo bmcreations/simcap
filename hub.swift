@@ -162,27 +162,29 @@ final class HubHID {
         keyboard.sendBarrier()
     }
 
-    // x and y are normalised to the screen, 0 to 1.
-    func touch(_ phase: TouchPhase, _ x: Double, _ y: Double) throws {
+    // x and y are normalised to the screen, 0 to 1. panel is the screenID
+    // the touch is aimed at, 0 for the main screen, as on a physical phone;
+    // see digitizerTarget.
+    func touch(_ phase: TouchPhase, _ x: Double, _ y: Double, panel: UInt32 = 0) throws {
         let type: DigitizerEventType = switch phase {
         case .down: .start
         case .move: .position
         case .up: .end
         }
-        try digitizer.send(pointOne: DigitizerPoint(x: x, y: y), pointTwo: nil, eventType: type, edge: .none, target: digitizerTarget())
+        try digitizer.send(pointOne: DigitizerPoint(x: x, y: y), pointTwo: nil, eventType: type, edge: .none, target: digitizerTarget(panel))
         barrier(phase)
     }
 
     // Two fingers in one event, which is what pinch and two-finger rotate
     // need: the legacy mouse builder carries a single point.
-    func touch2(_ phase: TouchPhase, _ x0: Double, _ y0: Double, _ x1: Double, _ y1: Double) throws {
+    func touch2(_ phase: TouchPhase, _ x0: Double, _ y0: Double, _ x1: Double, _ y1: Double, panel: UInt32 = 0) throws {
         let type: DigitizerEventType = switch phase {
         case .down: .start
         case .move: .position
         case .up: .end
         }
         try digitizer.send(pointOne: DigitizerPoint(x: x0, y: y0), pointTwo: DigitizerPoint(x: x1, y: y1),
-                           eventType: type, edge: .none, target: digitizerTarget())
+                           eventType: type, edge: .none, target: digitizerTarget(panel))
         barrier(phase)
     }
 
@@ -263,13 +265,13 @@ func openHinge(udid: String) -> Result<HubHinge, InputError> {
     return result
 }
 
-// digitizerTarget aims a touch at the lit panel. mainScreen is the outer
-// panel on an iPhone Duo, so an unfolded Duo took every touch and did
-// nothing with it.
-func digitizerTarget() -> DigitizerTarget {
+// digitizerTarget aims a touch at panel id, the one chooseSurface picked
+// (panels.swift), or mainScreen for 0. mainScreen is the outer panel on an
+// iPhone Duo, so an unfolded Duo took every touch and did nothing with it.
+func digitizerTarget(_ id: UInt32) -> DigitizerTarget {
     let all: [DigitizerTarget] = [.display1, .display2, .display3, .display4, .display5,
                                   .display6, .display7, .display8, .display9, .display10]
-    guard let id = litDisplay()?.id, id >= 1, Int(id) <= all.count else { return .mainScreen }
+    guard id >= 1, Int(id) <= all.count else { return .mainScreen }
     return all[Int(id) - 1]
 }
 

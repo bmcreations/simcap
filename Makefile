@@ -3,8 +3,8 @@
 # CoreDeviceMediaStreamSupport, which -phone-wifi negotiates through, ships
 # nested inside CoreDevice.framework.
 CDMS_DIR := /Library/Developer/PrivateFrameworks/CoreDevice.framework/Versions/A/Frameworks
-SRC := main.swift input.swift ax.swift hub.swift pasteboard.swift displays.swift devices.swift \
-	encoder.swift phone.swift phoneinput.swift phoneax.swift wifi.swift rtp.swift hostpasteboard.swift
+SRC := main.swift input.swift ax.swift hub.swift orientation.swift pasteboard.swift displays.swift devices.swift \
+	encoder.swift phone.swift phoneinput.swift phoneax.swift wifi.swift rtp.swift hostpasteboard.swift panels.swift
 
 .PHONY: simcap clean test
 
@@ -43,11 +43,13 @@ bridge:
 	cp bridge/target/release/simcap-bridge .build/simcap-bridge
 
 # test: the Wi-Fi depacketiser (rtp.swift) against RTP streams the tests
-# build, no phone needed.
+# build, no phone needed, and a foldable's surface choice (panels.swift).
 test:
 	mkdir -p .build
 	xcrun swiftc -parse-as-library rtp.swift tests/rtp_tests.swift -o .build/rtp_tests
 	.build/rtp_tests
+	xcrun swiftc -parse-as-library panels.swift tests/panels_tests.swift -o .build/panels_tests
+	.build/panels_tests
 
 clean:
 	rm -rf .build
