@@ -173,6 +173,11 @@ final class Encoder {
             // average-rate target spends the whole cap on every frame instead.
             props[kVTCompressionPropertyKey_Quality] = remoteQuality
             props[kVTCompressionPropertyKey_DataRateLimits] = [bitRate / 8, 1]
+            // Left unset, VideoToolbox puts in a keyframe every 2-3 s on its
+            // own. At a 2 Mbps cap each one is 20-60 KB, 100-250 ms of link,
+            // and the bench counted about 20 a minute, each a stall.
+            props[kVTCompressionPropertyKey_MaxKeyFrameInterval] = Int32.max
+            props[kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration] = 0.0
         } else {
             props[kVTCompressionPropertyKey_AverageBitRate] = bitRate
             props[kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration] = Double(keyframeSecs)
