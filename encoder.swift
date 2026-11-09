@@ -78,6 +78,11 @@ final class Encoder {
     // keyframe, quality-based rate under a cap, and a gate that holds it.
     let remote: Bool
     var gateOpen = false
+    // The remote track's frame budget (budget.swift). The encode callback
+    // spends it on another thread, so budgetLock guards it.
+    var budget = RateBudget(rateBps: 1, depthMs: 0, now: 0)
+    let budgetLock = NSLock()
+    var budgetWakePending = false
     // Asks for a capture at once; the remote encoder's is onRemoteWake.
     var wake: () -> Void = { onKeyRequest() }
 
@@ -87,6 +92,7 @@ final class Encoder {
         self.bitRate = bitRate
         self.maxSize = maxSize
         self.flagMaxSize = flagMaxSize
+        if remote { budget = RateBudget(rateBps: bitRate, depthMs: remoteBudgetMs, now: DispatchTime.now().uptimeNanoseconds) }
     }
 
     func write(_ data: Data) {
@@ -147,6 +153,11 @@ final class Encoder {
             off += len
         }
         packet(pts: pts, flags: key ? flagKey : 0, payload)
+        if remote {
+            budgetLock.lock()
+            budget.spend(payload.count, now: DispatchTime.now().uptimeNanoseconds)
+            budgetLock.unlock()
+        }
     }
 
     func makeSession(_ w: Int, _ h: Int) {
@@ -248,7 +259,7 @@ final class Encoder {
             writeHeader(outWidth, outHeight)
             makeScaler(w, h, t)
             makeSession(outWidth, outHeight)
-            log("\(remote ? "remote" : streamName) \(w)x\(h) turned \(t) as \(outWidth)x\(outHeight) \(bitRate)bps \(maxFPS)fps")
+            log("\(remote ? "remote" : streamName) \(w)x\(h) turned \(t) as \(outWidth)x\(outHeight) \(bitRate)bps \(maxFPS)fps\(remote ? " budget \(remoteBudgetMs)ms" : "")")
         } else if w != width || h != height || t != turn {
             // Rotation, a resize, or a fold onto another panel. The wire has no
             // way to re-announce size mid-stream except through the SPS, which
@@ -287,6 +298,23 @@ final class Encoder {
     func encodeRemote(_ upright: CVPixelBuffer, scaled: CVPixelBuffer, size: (Int, Int)) {
         ensureSession(CVPixelBufferGetWidth(upright), CVPixelBufferGetHeight(upright), 0)
         guard gateOpen else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        budgetLock.lock()
+        let allowed = budget.allow(now)
+        let wait = budget.untilClear()
+        budgetLock.unlock()
+        guard allowed else {
+            // Skip this capture, and take one as soon as the debt clears so the
+            // last change is not left waiting for the 250 ms idle floor.
+            if !budgetWakePending {
+                budgetWakePending = true
+                encodeQueue.asyncAfter(deadline: .now() + .nanoseconds(Int(wait))) { [self] in
+                    budgetWakePending = false
+                    wake()
+                }
+            }
+            return
+        }
         var pixels = upright
         if (outWidth, outHeight) == size {
             pixels = scaled
@@ -327,6 +355,9 @@ final class Encoder {
     // setCap sets the remote encoder's rate cap, live.
     func setCap(_ bps: Int) {
         bitRate = bps
+        budgetLock.lock()
+        budget.setRate(bps, now: DispatchTime.now().uptimeNanoseconds)
+        budgetLock.unlock()
         guard let s = session else { return }
         let st = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: [bps / 8, 1] as CFTypeRef)
         log("remote cap \(bps)bps\(st == noErr ? "" : " failed: \(st)")")
