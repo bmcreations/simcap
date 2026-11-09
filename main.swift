@@ -26,7 +26,9 @@
 // TYPE_RESET_VIDEO, forces the next frame to be a keyframe. A byte of 0x80
 // followed by a big-endian u32 sets the average bitrate on the running
 // encoder, which scrcpy has no way to do. A byte of 0x81 followed by a
-// big-endian u16 sets the longest edge, 0 for the -maxsize flag's.
+// big-endian u16 sets the longest edge, 0 for the -maxsize flag's. With -remote,
+// bytes 0x82 (gate u8), 0x83 (keyframe), 0x84 (cap u32) and 0x85 (longest edge
+// u16) drive a second encoder on fd 4; see encoder.swift.
 
 import CoreMedia
 import CoreVideo
@@ -46,7 +48,7 @@ func flag(_ name: String, _ def: Int) -> Int {
 // -caps lets the server tell a build with input from an older one, which
 // would read -input as nothing and start streaming video into the reply pipe.
 if args == ["-caps"] {
-    print("video\ninput\nui\nroute\nbitrate\nresize\npasteboard\npasteboardimage\nhit\ndevices\nphone\nphoneinput\nphonewifi\nphonehevc\nhostpasteboard")
+    print("video\ninput\nui\nroute\nbitrate\nresize\npasteboard\npasteboardimage\nhit\ndevices\nphone\nphoneinput\nphonewifi\nphonehevc\nhostpasteboard\nremote")
     exit(0)
 }
 // Before CoreSimulator is loaded: a physical device needs none of it.
@@ -71,6 +73,10 @@ args.removeAll { $0 == "-input" }
 // in the same wire format as stdout's H.264 (wifi.swift, "passthrough").
 let hevcOut = args.contains("-hevc")
 args.removeAll { $0 == "-hevc" }
+// -remote, with a simulator: a second H.264 track on fd 4, held until stdin
+// opens its gate (0x82). See encoder.swift.
+let remoteOut = args.contains("-remote")
+args.removeAll { $0 == "-remote" }
 // A var because stdin can change it; a session rebuilt for a new shape keeps
 // the rate last set rather than going back to the flag's.
 var bitRate = flag("-bitrate", 8_000_000)
@@ -105,6 +111,8 @@ if args.count >= 2, args[1] == "-phone" {
 if args.count >= 2, args[1] == "-phone-wifi" {
     runPhoneWifi(identifier: args[0], name: args.count > 2 ? args[2] : "")
 }
+
+if remoteOut { startRemote(bitRate: 4_000_000) }
 
 // MARK: - private frameworks
 
@@ -302,6 +310,7 @@ idle.setEventHandler {
 idle.resume()
 
 onKeyRequest = schedule
+onRemoteWake = schedule
 onLitChange = schedule
 startControl()
 

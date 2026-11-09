@@ -74,9 +74,16 @@ final class Encoder {
     var forceKey = true
     var lastEncode: UInt64 = 0
     var frames = 0
+    // The remote track: its own header name, a config packet before every
+    // keyframe, quality-based rate under a cap, and a gate that holds it.
+    let remote: Bool
+    var gateOpen = false
+    // Asks for a capture at once; the remote encoder's is onRemoteWake.
+    var wake: () -> Void = { onKeyRequest() }
 
-    init(out: FileHandle, bitRate: Int, maxSize: Int, flagMaxSize: Int) {
+    init(out: FileHandle, bitRate: Int, maxSize: Int, flagMaxSize: Int, remote: Bool = false) {
         self.out = out
+        self.remote = remote
         self.bitRate = bitRate
         self.maxSize = maxSize
         self.flagMaxSize = flagMaxSize
@@ -113,7 +120,7 @@ final class Encoder {
                                                                    nalUnitHeaderLengthOut: nil)
                 if let ptr { params += startCode + Data(bytes: ptr, count: size) }
             }
-            if params != lastParams {
+            if params != lastParams || remote {
                 lastParams = params
                 packet(pts: 0, flags: flagConfig, params)
             }
@@ -146,14 +153,22 @@ final class Encoder {
                                             compressedDataAllocator: nil, outputCallback: nil, refcon: nil,
                                             compressionSessionOut: &s)
         guard st == noErr, let s else { fail("VTCompressionSessionCreate: \(st)") }
-        let props: [CFString: Any] = [
+        var props: [CFString: Any] = [
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
             kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_H264_High_AutoLevel,
             kVTCompressionPropertyKey_AverageBitRate: bitRate,
             kVTCompressionPropertyKey_ExpectedFrameRate: maxFPS,
-            kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: Double(keyframeSecs),
         ]
+        if remote {
+            // No keyframe interval: keyframes only on request. Quality is
+            // rejected (-12900) under low-latency rate control on this Mac's
+            // hardware encoder, so the average rate and the limit both carry
+            // the cap.
+            props[kVTCompressionPropertyKey_DataRateLimits] = [bitRate / 8, 1]
+        } else {
+            props[kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration] = Double(keyframeSecs)
+        }
         for (k, v) in props { VTSessionSetProperty(s, key: k, value: v as CFTypeRef) }
         VTCompressionSessionPrepareToEncodeFrames(s)
         session = s
@@ -197,7 +212,7 @@ final class Encoder {
 
     // The stream header needs dimensions, so it goes out with the first surface.
     func writeHeader(_ w: Int, _ h: Int) {
-        var name = Data(streamName.utf8.prefix(63))
+        var name = Data((remote ? "remote" : streamName).utf8.prefix(63))
         name += Data(count: 64 - name.count)
         write(name + be32(0x6832_3634) + be32(UInt32(w)) + be32(UInt32(h))) // "h264"
     }
@@ -210,10 +225,9 @@ final class Encoder {
         encodePixels(pixels, t)
     }
 
-    // encodePixels encodes one picture turned t degrees clockwise from upright.
-    // Runs on encodeQueue, which owns the session.
-    func encodePixels(_ captured: CVPixelBuffer, _ t: Int) {
-        let w = CVPixelBufferGetWidth(captured), h = CVPixelBufferGetHeight(captured)
+    // ensureSession starts the session on the first picture and rebuilds it
+    // when the framebuffer's shape changes. t is the turn from upright.
+    func ensureSession(_ w: Int, _ h: Int, _ t: Int) {
         let (uw, uh) = turned(w, h, t)
         if session == nil {
             width = w; height = h; turn = t
@@ -221,14 +235,20 @@ final class Encoder {
             writeHeader(outWidth, outHeight)
             makeScaler(w, h, t)
             makeSession(outWidth, outHeight)
-            log("\(streamName) \(w)x\(h) turned \(t) as \(outWidth)x\(outHeight) \(bitRate)bps \(maxFPS)fps")
+            log("\(remote ? "remote" : streamName) \(w)x\(h) turned \(t) as \(outWidth)x\(outHeight) \(bitRate)bps \(maxFPS)fps")
         } else if w != width || h != height || t != turn {
             // Rotation, a resize, or a fold onto another panel. The wire has no
             // way to re-announce size mid-stream except through the SPS, which
             // the config packet carries.
             rebuild(w, h, t)
-            log("now \(w)x\(h) turned \(t) as \(outWidth)x\(outHeight)")
+            log("\(remote ? "remote " : "")now \(w)x\(h) turned \(t) as \(outWidth)x\(outHeight)")
         }
+    }
+
+    // encodePixels encodes one picture turned t degrees clockwise from upright.
+    // Runs on encodeQueue, which owns the session.
+    func encodePixels(_ captured: CVPixelBuffer, _ t: Int) {
+        ensureSession(CVPixelBufferGetWidth(captured), CVPixelBufferGetHeight(captured), t)
         var pixels = captured
         if let rotator, let rotatedPool {
             var out: CVPixelBuffer?
@@ -236,12 +256,38 @@ final class Encoder {
                   VTPixelRotationSessionRotateImage(rotator, pixels, out) == noErr else { return }
             pixels = out
         }
+        let upright = pixels
         if let scaler, let scaledPool {
             var out: CVPixelBuffer?
             guard CVPixelBufferPoolCreatePixelBuffer(nil, scaledPool, &out) == kCVReturnSuccess, let out,
                   VTPixelTransferSessionTransferImage(scaler, from: pixels, to: out) == noErr else { return }
             pixels = out
         }
+        submit(pixels)
+        remoteEncoder?.encodeRemote(upright, scaled: pixels, size: (outWidth, outHeight))
+    }
+
+    // encodeRemote feeds the remote encoder the main encoder's upright picture
+    // and, when both encode at one size, its scaled one too. The session and
+    // header are set up while the gate is held, so the reader has the size
+    // early, but nothing is scaled or encoded until it opens.
+    func encodeRemote(_ upright: CVPixelBuffer, scaled: CVPixelBuffer, size: (Int, Int)) {
+        ensureSession(CVPixelBufferGetWidth(upright), CVPixelBufferGetHeight(upright), 0)
+        guard gateOpen else { return }
+        var pixels = upright
+        if (outWidth, outHeight) == size {
+            pixels = scaled
+        } else if let scaler, let scaledPool {
+            var out: CVPixelBuffer?
+            guard CVPixelBufferPoolCreatePixelBuffer(nil, scaledPool, &out) == kCVReturnSuccess, let out,
+                  VTPixelTransferSessionTransferImage(scaler, from: upright, to: out) == noErr else { return }
+            pixels = out
+        }
+        submit(pixels)
+    }
+
+    // submit hands one prepared picture to the session.
+    func submit(_ pixels: CVPixelBuffer) {
         // t0 first: a global outside main.swift is set on first use, so reading
         // it after now would put it later than now and the subtraction would trap.
         let start = t0
@@ -255,6 +301,23 @@ final class Encoder {
                                         frameProperties: opts as CFDictionary?, infoFlagsOut: nil) { [self] st, _, sbuf in
             if st == noErr, let sbuf { annexB(sbuf) }
         }
+    }
+
+    // setGate opens or holds the remote encoder. Opening captures at once.
+    func setGate(_ open: Bool) {
+        guard open != gateOpen else { return }
+        gateOpen = open
+        log("remote gate \(open ? "open" : "held")")
+        if open { wake() }
+    }
+
+    // setCap sets the remote encoder's rate cap, live.
+    func setCap(_ bps: Int) {
+        bitRate = bps
+        guard let s = session else { return }
+        let a = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bps as CFTypeRef)
+        let b = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: [bps / 8, 1] as CFTypeRef)
+        log("remote cap \(bps)bps\(a == noErr && b == noErr ? "" : " failed: \(a) \(b)")")
     }
 
     // setBitRate changes the running encoder's target. Runs on encodeQueue, which
@@ -290,12 +353,25 @@ final class Encoder {
         guard size != (outWidth, outHeight) else { return }
         rebuild(width, height, turn)
         log("maxsize \(maxSize): now \(outWidth)x\(outHeight)")
-        onKeyRequest()
+        wake()
     }
 }
 
 // The stdout encoder, which the simulator and phone paths feed.
 let mainEncoder = Encoder(out: FileHandle.standardOutput, bitRate: bitRate, maxSize: maxSize, flagMaxSize: flagMaxSize)
+
+// The remote encoder, on fd 4 with -remote; nil without. Its gate starts held.
+var remoteEncoder: Encoder?
+// Set by the simulator path: capture now. The remote encoder's wake-up.
+var onRemoteWake: () -> Void = {}
+
+func startRemote(bitRate: Int) {
+    if fcntl(4, F_GETFD) == -1 { fail("-remote writes to fd 4, which is not open") }
+    let r = Encoder(out: FileHandle(fileDescriptor: 4, closeOnDealloc: false), bitRate: bitRate, maxSize: flagMaxSize,
+                    flagMaxSize: flagMaxSize, remote: true)
+    r.wake = { onRemoteWake() }
+    remoteEncoder = r
+}
 
 // Callers outside this file pace captures by the main encoder's last frame.
 var lastEncode: UInt64 {
@@ -316,7 +392,8 @@ let minGap = UInt64(1_000_000_000 / max(1, maxFPS)) * 3 / 4
 var onKeyRequest: () -> Void = {}
 
 // startControl reads stdin: EOF means stop; byte 17 asks for a keyframe; 0x80
-// and a u32 sets the bitrate; 0x81 and a u16 sets the longest edge. Parsed as a stream rather than scanned for 17,
+// and a u32 sets the bitrate; 0x81 and a u16 sets the longest edge; 0x82 to 0x85
+// drive the remote encoder (-remote): gate u8, keyframe, cap u32, longest edge u16. Parsed as a stream rather than scanned for 17,
 // because the u32 can contain one.
 func startControl() {
     signal(SIGPIPE, SIG_IGN)
@@ -336,6 +413,24 @@ func startControl() {
                     let bps = q[1...4].reduce(0) { $0 << 8 | Int($1) }
                     q.removeFirst(5)
                     encodeQueue.async { mainEncoder.setBitRate(bps) }
+                } else if op == 0x82 {
+                    guard q.count >= 2 else { break }
+                    let open = q[1] != 0
+                    q.removeFirst(2)
+                    encodeQueue.async { remoteEncoder?.setGate(open) }
+                } else if op == 0x83 {
+                    q.removeFirst()
+                    encodeQueue.async { remoteEncoder?.forceKey = true; remoteEncoder?.wake() }
+                } else if op == 0x84 {
+                    guard q.count >= 5 else { break }
+                    let bps = q[1...4].reduce(0) { $0 << 8 | Int($1) }
+                    q.removeFirst(5)
+                    encodeQueue.async { remoteEncoder?.setCap(bps) }
+                } else if op == 0x85 {
+                    guard q.count >= 3 else { break }
+                    let px = Int(q[1]) << 8 | Int(q[2])
+                    q.removeFirst(3)
+                    encodeQueue.async { remoteEncoder?.setMaxSize(px) }
                 } else if op == 0x81 {
                     guard q.count >= 3 else { break }
                     let px = Int(q[1]) << 8 | Int(q[2])
