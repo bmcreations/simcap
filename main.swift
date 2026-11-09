@@ -81,7 +81,7 @@ let maxFPS = flag("-fps", 60)
 let flagMaxSize = flag("-maxsize", 0)
 // A var because stdin can lower it on a slow link (0x81); a rebuild for a new
 // shape keeps the size last set, as bitRate does.
-var maxSize = flagMaxSize
+var maxSize = flagMaxSize // the Encoder keeps its own copy; this seeds it
 // Seconds between keyframes. A viewer that sheds a frame asks for one, so this
 // only bounds the wait when nobody asks.
 let keyframeSecs = max(1, flag("-keyint", 1))
