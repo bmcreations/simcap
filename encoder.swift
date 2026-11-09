@@ -118,7 +118,11 @@ final class Encoder {
                 CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, parameterSetIndex: i, parameterSetPointerOut: &ptr,
                                                                    parameterSetSizeOut: &size, parameterSetCountOut: nil,
                                                                    nalUnitHeaderLengthOut: nil)
-                if let ptr { params += startCode + Data(bytes: ptr, count: size) }
+                guard let ptr else { continue }
+                let ps = Data(bytes: ptr, count: size)
+                // The remote encoder's SPS has no VUI; without one a browser
+                // decoder holds up to 8 pictures before output (sps.swift).
+                params += startCode + (remote ? spsNoReorder(ps) ?? ps : ps)
             }
             if params != lastParams || remote {
                 lastParams = params
