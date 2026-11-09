@@ -91,6 +91,10 @@ var maxSize = flagMaxSize // the Encoder keeps its own copy; this seeds it
 // Seconds between keyframes. A viewer that sheds a frame asks for one, so this
 // only bounds the wait when nobody asks.
 let keyframeSecs = max(1, flag("-keyint", 1))
+// The remote encoder's constant quality, 0-100 (VideoToolbox Quality x 100).
+// 60 kept a scrolling 664x1440 list near 0.9-1.9 Mbps in an offline test; the
+// rate cap from stdin (0x84) bounds it either way.
+let remoteQuality = Double(min(100, max(1, flag("-remote-quality", 60)))) / 100
 guard let udid = args.first else {
     FileHandle.standardError.write("usage: simcap <udid> [-bitrate bps] [-fps n] [-maxsize px] [-keyint s] [-input]\n".data(using: .utf8)!)
     exit(2)

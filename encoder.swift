@@ -147,7 +147,10 @@ final class Encoder {
 
     func makeSession(_ w: Int, _ h: Int) {
         var s: VTCompressionSession?
-        let spec: [CFString: Any] = [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true]
+        // The remote encoder runs without low-latency rate control: that mode
+        // rejects Quality (-12900) on this Mac's hardware encoder, and encode
+        // time is the same without it (about 8 ms a frame at 664x1440, 60 fps).
+        let spec: [CFString: Any] = remote ? [:] : [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true]
         let st = VTCompressionSessionCreate(allocator: nil, width: Int32(w), height: Int32(h), codecType: kCMVideoCodecType_H264,
                                             encoderSpecification: spec as CFDictionary, imageBufferAttributes: nil,
                                             compressedDataAllocator: nil, outputCallback: nil, refcon: nil,
@@ -157,16 +160,17 @@ final class Encoder {
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
             kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_H264_High_AutoLevel,
-            kVTCompressionPropertyKey_AverageBitRate: bitRate,
             kVTCompressionPropertyKey_ExpectedFrameRate: maxFPS,
         ]
         if remote {
-            // No keyframe interval: keyframes only on request. Quality is
-            // rejected (-12900) under low-latency rate control on this Mac's
-            // hardware encoder, so the average rate and the limit both carry
-            // the cap.
+            // No keyframe interval: keyframes only on request. Constant quality
+            // under a rate ceiling, like x264's CRF with VBV: each frame spends
+            // what its content needs, and the limit holds it to the cap. An
+            // average-rate target spends the whole cap on every frame instead.
+            props[kVTCompressionPropertyKey_Quality] = remoteQuality
             props[kVTCompressionPropertyKey_DataRateLimits] = [bitRate / 8, 1]
         } else {
+            props[kVTCompressionPropertyKey_AverageBitRate] = bitRate
             props[kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration] = Double(keyframeSecs)
         }
         for (k, v) in props { VTSessionSetProperty(s, key: k, value: v as CFTypeRef) }
@@ -315,9 +319,8 @@ final class Encoder {
     func setCap(_ bps: Int) {
         bitRate = bps
         guard let s = session else { return }
-        let a = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bps as CFTypeRef)
-        let b = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: [bps / 8, 1] as CFTypeRef)
-        log("remote cap \(bps)bps\(a == noErr && b == noErr ? "" : " failed: \(a) \(b)")")
+        let st = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: [bps / 8, 1] as CFTypeRef)
+        log("remote cap \(bps)bps\(st == noErr ? "" : " failed: \(st)")")
     }
 
     // setBitRate changes the running encoder's target. Runs on encodeQueue, which
