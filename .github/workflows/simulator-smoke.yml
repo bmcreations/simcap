@@ -1,0 +1,53 @@
+name: simulator smoke
+
+# Builds simcap on a hosted macOS runner, streams a simulator and sends it
+# input (ci/smoke.py). Hosted runners are virtual machines, so this is also
+# the check that capture and encode work without a physical GPU or display.
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner label
+        default: macos-26
+  pull_request:
+    paths:
+      - .github/workflows/simulator-smoke.yml
+      - ci/smoke.py
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select the newest installed Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          newest=$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)
+          sudo xcode-select -s "$newest"
+          xcodebuild -version
+
+      - name: Build
+        run: make simcap
+
+      - name: Unit tests
+        run: make test
+
+      - name: Install ffmpeg
+        continue-on-error: true
+        run: brew install ffmpeg
+
+      - name: Stream and drive a simulator
+        run: python3 ci/smoke.py .build/smoke
+
+      - name: Upload the capture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simcap-smoke
+          path: .build/smoke
+          if-no-files-found: warn
