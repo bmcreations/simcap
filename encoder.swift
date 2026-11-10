@@ -75,7 +75,7 @@ final class Encoder {
     var lastEncode: UInt64 = 0
     var frames = 0
     // The remote track: its own header name, a config packet before every
-    // keyframe, quality-based rate under a cap, and a gate that holds it.
+    // keyframe, quality steered to a rate cap, and a gate that holds it.
     let remote: Bool
     var gateOpen = false
     // The remote track's frame budget (budget.swift). The encode callback
@@ -83,6 +83,10 @@ final class Encoder {
     var budget = RateBudget(rateBps: 1, depthMs: 0, now: 0)
     let budgetLock = NSLock()
     var budgetWakePending = false
+    // The remote encoder's Quality, steered from its frame sizes (budget.swift),
+    // also under budgetLock; appliedQ is what the session has, on encodeQueue.
+    var steer = QualitySteer(rateBps: 1, maxQ: 1)
+    var appliedQ = 0.0
     // Asks for a capture at once; the remote encoder's is onRemoteWake.
     var wake: () -> Void = { onKeyRequest() }
 
@@ -92,7 +96,10 @@ final class Encoder {
         self.bitRate = bitRate
         self.maxSize = maxSize
         self.flagMaxSize = flagMaxSize
-        if remote { budget = RateBudget(rateBps: bitRate, depthMs: remoteBudgetMs, now: DispatchTime.now().uptimeNanoseconds) }
+        if remote {
+            budget = RateBudget(rateBps: bitRate, depthMs: remoteBudgetMs, now: DispatchTime.now().uptimeNanoseconds)
+            steer = QualitySteer(rateBps: bitRate, maxQ: remoteQuality)
+        }
     }
 
     func write(_ data: Data) {
@@ -155,7 +162,9 @@ final class Encoder {
         packet(pts: pts, flags: key ? flagKey : 0, payload)
         if remote {
             budgetLock.lock()
-            budget.spend(payload.count, now: DispatchTime.now().uptimeNanoseconds)
+            let now = DispatchTime.now().uptimeNanoseconds
+            budget.spend(payload.count, now: now)
+            if !key { steer.observe(payload.count, now: now) }
             budgetLock.unlock()
         }
     }
@@ -178,12 +187,13 @@ final class Encoder {
             kVTCompressionPropertyKey_ExpectedFrameRate: maxFPS,
         ]
         if remote {
-            // No keyframe interval: keyframes only on request. Constant quality
-            // under a rate ceiling, like x264's CRF with VBV: each frame spends
-            // what its content needs, and the limit holds it to the cap. An
-            // average-rate target spends the whole cap on every frame instead.
-            props[kVTCompressionPropertyKey_Quality] = remoteQuality
-            props[kVTCompressionPropertyKey_DataRateLimits] = [bitRate / 8, 1]
+            // Quality steered from frame size (QualitySteer), and no
+            // DataRateLimits: VideoToolbox ignores Quality while a limit is set.
+            // The frame budget bounds what a single frame can cost.
+            budgetLock.lock()
+            appliedQ = steer.q
+            budgetLock.unlock()
+            props[kVTCompressionPropertyKey_Quality] = appliedQ
             // Left unset, VideoToolbox puts in a keyframe every 2-3 s on its
             // own. At a 2 Mbps cap each one is 20-60 KB, 100-250 ms of link,
             // and the bench counted about 20 a minute, each a stall.
@@ -337,6 +347,15 @@ final class Encoder {
         let opts: [CFString: Any]? = forceKey ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] : nil
         forceKey = false
         lastEncode = now
+        if remote, let s = session {
+            budgetLock.lock()
+            let q = steer.q
+            budgetLock.unlock()
+            if q != appliedQ {
+                VTSessionSetProperty(s, key: kVTCompressionPropertyKey_Quality, value: q as CFTypeRef)
+                appliedQ = q
+            }
+        }
         frames += 1
         VTCompressionSessionEncodeFrame(session!, imageBuffer: pixels, presentationTimeStamp: pts, duration: .invalid,
                                         frameProperties: opts as CFDictionary?, infoFlagsOut: nil) { [self] st, _, sbuf in
@@ -357,10 +376,10 @@ final class Encoder {
         bitRate = bps
         budgetLock.lock()
         budget.setRate(bps, now: DispatchTime.now().uptimeNanoseconds)
+        steer.setRate(bps)
+        let q = steer.q
         budgetLock.unlock()
-        guard let s = session else { return }
-        let st = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: [bps / 8, 1] as CFTypeRef)
-        log("remote cap \(bps)bps\(st == noErr ? "" : " failed: \(st)")")
+        log("remote cap \(bps)bps quality \(String(format: "%.2f", q))")
     }
 
     // setBitRate changes the running encoder's target. Runs on encodeQueue, which

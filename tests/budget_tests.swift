@@ -57,6 +57,36 @@ struct BudgetTests {
         r.setRate(1_000_000, now: 0)
         check(r.tokens <= 6_250, "setRate trims credit to the new depth")
 
+        // QualitySteer against a model of the offline sizes: a delta frame grows
+        // about 19x from Quality 0.3 to 0.6 (busy scroll 6 KB -> 115 KB).
+        func size(_ q: Double, at06: Double) -> Int { Int(at06 * exp(9.8 * (q - 0.6))) }
+        let frame = 16_667_000 as UInt64
+        var st = QualitySteer(rateBps: 2_000_000, maxQ: 0.6)
+        check(abs(st.target - 8333) < 1, "2 Mbps at 30 fps aims for 8,333 B, got \(st.target)")
+        var now: UInt64 = 0
+        for _ in 0..<10 { st.observe(size(st.q, at06: 115_000), now: now); now += frame }
+        check(Double(size(st.q, at06: 115_000)) <= 1.5 * st.target, "busy scroll held near the target within 10 frames, q \(st.q)")
+        var biggest = 0
+        for _ in 0..<120 { let b = size(st.q, at06: 115_000); biggest = max(biggest, b); st.observe(b, now: now); now += frame }
+        check(Double(biggest) <= 1.5 * st.target, "settled busy frames stay under 1.5x target, biggest \(biggest)")
+
+        let busyQ = st.q
+        for _ in 0..<60 { st.observe(size(st.q, at06: 1_000), now: now); now += frame } // 1 s of light content
+        check(st.q <= busyQ * pow(1.03, 10) + 1e-9, "raises at most 3% per 100 ms, \(busyQ) -> \(st.q)")
+        check(st.q > busyQ, "raises while frames are well under the target")
+
+        var light = QualitySteer(rateBps: 2_000_000, maxQ: 0.6)
+        for i in 0..<120 { light.observe(size(light.q, at06: 3_000), now: UInt64(i) * frame) }
+        check(light.q == 0.6, "light content keeps the top quality, got \(light.q)")
+
+        var floor = QualitySteer(rateBps: 500_000, maxQ: 0.6)
+        for i in 0..<60 { floor.observe(500_000, now: UInt64(i) * frame) }
+        check(floor.q == 0.1, "never below the floor, got \(floor.q)")
+
+        var cap = QualitySteer(rateBps: 2_000_000, maxQ: 0.6)
+        cap.setRate(4_000_000)
+        check(abs(cap.target - 16_667) < 1, "a higher cap raises the target, got \(cap.target)")
+
         print(failures == 0 ? "budget: all passed" : "budget: \(failures) failed")
         exit(failures == 0 ? 0 : 1)
     }

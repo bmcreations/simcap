@@ -52,3 +52,49 @@ struct RateBudget {
         tokens >= 0 ? 0 : UInt64(-tokens / (Double(rateBps) / 8) * 1e9) + 1
     }
 }
+
+// QualitySteer sets the remote encoder's Quality from the size of the frames it
+// makes. VideoToolbox ignores Quality once DataRateLimits is set: under a 2 Mbps
+// limit a busy scroll came out at 30-57 KB a frame whatever the quality, and the
+// budget above could only skip. Without the limit Quality sets the size, so the
+// steer holds delta frames near cap / 8 / fps: it cuts at once on a frame over
+// the target, in proportion to the overshoot, and raises 3% at most every 100 ms
+// while frames come in well under it. Keyframes are left out; they are asked for.
+// Offline, on noisy photo rows scrolling 96 px a frame at 2 Mbps, delta frames
+// went from 35-45 KB to 6 KB (p90), and a live change takes effect on the next
+// frame without a new SPS. Times are uptime nanoseconds.
+struct QualitySteer {
+    let minQ: Double
+    let maxQ: Double
+    let fps: Double
+    private(set) var q: Double
+    private(set) var rateBps: Int
+    private var lastRaise: UInt64 = 0
+
+    init(rateBps: Int, maxQ: Double, minQ: Double = 0.1, fps: Double = 30) {
+        self.rateBps = max(1, rateBps)
+        self.maxQ = maxQ
+        self.minQ = min(minQ, maxQ)
+        self.fps = fps
+        self.q = maxQ
+    }
+
+    // target is the byte size a delta frame aims for.
+    var target: Double { Double(rateBps) / 8 / fps }
+
+    mutating func setRate(_ bps: Int) { rateBps = max(1, bps) }
+
+    // observe takes one delta frame's size.
+    mutating func observe(_ bytes: Int, now: UInt64) {
+        let b = Double(bytes), t = target
+        if b > 1.5 * t {
+            q *= max(0.5, (t / b).squareRoot())
+        } else if b > t {
+            q *= 0.95
+        } else if b < 0.6 * t, now >= lastRaise + 100_000_000 {
+            q *= 1.03
+            lastRaise = now
+        }
+        q = min(maxQ, max(minQ, q))
+    }
+}
