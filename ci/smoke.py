@@ -23,6 +23,7 @@ import time
 SIMCAP = ".build/simcap"
 CAPTURE_SECS = 12
 MIN_FRAMES = 30
+FIRST_BYTES_SECS = 150
 FLAG_CONFIG = 1 << 63
 FLAG_KEY = 1 << 62
 
@@ -126,7 +127,23 @@ def main():
     stream = os.path.join(out, "stream.bin")
     with open(stream, "wb") as so, open(os.path.join(out, "simcap.log"), "wb") as se:
         cap = subprocess.Popen([SIMCAP, udid, "-fps", "30"], stdout=so, stderr=se)
-        time.sleep(3)
+        # The first simctl screenshot on a hosted runner took 77 s, so give
+        # simcap's first bytes longer than a desk Mac needs.
+        t2 = time.time()
+        while time.time() - t2 < FIRST_BYTES_SECS and os.path.getsize(stream) == 0 and cap.poll() is None:
+            time.sleep(1)
+        first = os.path.getsize(stream)
+        note("First bytes", f"{first} bytes after {time.time() - t2:.0f}s" if first
+             else f"none after {time.time() - t2:.0f}s")
+        if not first and cap.poll() is None:
+            # Where simcap is waiting. Unprivileged sample returned an empty
+            # call graph on the runner, so use sudo when it needs no password.
+            sample = os.path.join(out, "simcap-sample.txt")
+            sudo = ["sudo", "-n"] if run("sudo", "-n", "true")[0] == 0 else []
+            run(*sudo, "sample", str(cap.pid), "3", "-file", sample)
+            run(*sudo, "chmod", "a+r", sample)
+            text = open(sample, errors="replace").read() if os.path.exists(sample) else "(no sample written)"
+            note("simcap sample", text.split("Binary Images:")[0][-7000:])
 
         # Swipes across the home screen give the encoder motion and test the
         # input path at once. Coordinates are framebuffer pixels.
@@ -149,9 +166,6 @@ def main():
 
         time.sleep(max(0, CAPTURE_SECS - 3))
         early = cap.poll()
-        if early is None and os.path.getsize(stream) == 0:
-            # Nothing written: record where simcap is waiting.
-            note("simcap sample (no output yet)", run("sample", str(cap.pid), "2", "-mayDie")[1][:6000])
         cap.terminate()
         try:
             cap.wait(timeout=10)
