@@ -117,9 +117,11 @@ def main():
 
     # simctl's own screenshot before simcap touches the simulator. If this
     # fails, the simulator is not drawing on this host and a simcap failure
-    # below says nothing about simcap.
+    # below says nothing about simcap. The first screenshot after boot took
+    # 77 s, 109 s and over 120 s on the hosted xcode-27 runner.
     t1 = time.time()
-    code, msg = run("xcrun", "simctl", "io", udid, "screenshot", os.path.join(out, "simctl-before.png"))
+    code, msg = run("xcrun", "simctl", "io", udid, "screenshot", os.path.join(out, "simctl-before.png"),
+                    timeout=300)
     note("simctl screenshot before simcap", f"exit {code} in {time.time() - t1:.1f}s\n{msg}")
     if code != 0:
         failures.append("simulator: simctl could not take a screenshot before simcap started")
