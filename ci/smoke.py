@@ -126,7 +126,9 @@ def main():
 
     stream = os.path.join(out, "stream.bin")
     with open(stream, "wb") as so, open(os.path.join(out, "simcap.log"), "wb") as se:
-        cap = subprocess.Popen([SIMCAP, udid, "-fps", "30"], stdout=so, stderr=se)
+        # stdin is a pipe held open: simcap stops at EOF on stdin, and a CI
+        # job's stdin is already closed.
+        cap = subprocess.Popen([SIMCAP, udid, "-fps", "30"], stdin=subprocess.PIPE, stdout=so, stderr=se)
         # The first simctl screenshot on a hosted runner took 77 s, so give
         # simcap's first bytes longer than a desk Mac needs.
         t2 = time.time()
