@@ -26,7 +26,9 @@
 // TYPE_RESET_VIDEO, forces the next frame to be a keyframe. A byte of 0x80
 // followed by a big-endian u32 sets the average bitrate on the running
 // encoder, which scrcpy has no way to do. A byte of 0x81 followed by a
-// big-endian u16 sets the longest edge, 0 for the -maxsize flag's.
+// big-endian u16 sets the longest edge, 0 for the -maxsize flag's. With -remote,
+// bytes 0x82 (gate u8), 0x83 (keyframe), 0x84 (cap u32) and 0x85 (longest edge
+// u16) drive a second encoder on fd 4; see encoder.swift.
 
 import CoreMedia
 import CoreVideo
@@ -46,7 +48,7 @@ func flag(_ name: String, _ def: Int) -> Int {
 // -caps lets the server tell a build with input from an older one, which
 // would read -input as nothing and start streaming video into the reply pipe.
 if args == ["-caps"] {
-    print("video\ninput\nui\nroute\nbitrate\nresize\npasteboard\npasteboardimage\nhit\ndevices\nphone\nphoneinput\nphonewifi\nphonehevc\nhostpasteboard")
+    print("video\ninput\nui\nroute\nbitrate\nresize\npasteboard\npasteboardimage\nhit\ndevices\nphone\nphoneinput\nphonewifi\nphonehevc\nhostpasteboard\nremote")
     exit(0)
 }
 // Before CoreSimulator is loaded: a physical device needs none of it.
@@ -71,6 +73,10 @@ args.removeAll { $0 == "-input" }
 // in the same wire format as stdout's H.264 (wifi.swift, "passthrough").
 let hevcOut = args.contains("-hevc")
 args.removeAll { $0 == "-hevc" }
+// -remote, with a simulator: a second H.264 track on fd 4, held until stdin
+// opens its gate (0x82). See encoder.swift.
+let remoteOut = args.contains("-remote")
+args.removeAll { $0 == "-remote" }
 // A var because stdin can change it; a session rebuilt for a new shape keeps
 // the rate last set rather than going back to the flag's.
 var bitRate = flag("-bitrate", 8_000_000)
@@ -81,10 +87,19 @@ let maxFPS = flag("-fps", 60)
 let flagMaxSize = flag("-maxsize", 0)
 // A var because stdin can lower it on a slow link (0x81); a rebuild for a new
 // shape keeps the size last set, as bitRate does.
-var maxSize = flagMaxSize
+var maxSize = flagMaxSize // the Encoder keeps its own copy; this seeds it
 // Seconds between keyframes. A viewer that sheds a frame asks for one, so this
 // only bounds the wait when nobody asks.
 let keyframeSecs = max(1, flag("-keyint", 1))
+// The remote encoder's highest quality, 0-100 (VideoToolbox Quality x 100). It
+// starts here and QualitySteer (budget.swift) lowers it to hold frames to the
+// rate cap from stdin (0x84). 60 kept a scrolling 664x1440 list near
+// 0.9-1.9 Mbps in an offline test.
+let remoteQuality = Double(min(100, max(1, flag("-remote-quality", 60)))) / 100
+// -remote-budget-ms is how much link time the remote track may queue in a
+// burst before it skips captures (budget.swift); 0 turns the budget off.
+// SIMCAP_REMOTE_BUDGET_MS sets the default, for the stream bench.
+let remoteBudgetMs = max(0, flag("-remote-budget-ms", Int(ProcessInfo.processInfo.environment["SIMCAP_REMOTE_BUDGET_MS"] ?? "") ?? 50))
 guard let udid = args.first else {
     FileHandle.standardError.write("usage: simcap <udid> [-bitrate bps] [-fps n] [-maxsize px] [-keyint s] [-input]\n".data(using: .utf8)!)
     exit(2)
@@ -105,6 +120,8 @@ if args.count >= 2, args[1] == "-phone" {
 if args.count >= 2, args[1] == "-phone-wifi" {
     runPhoneWifi(identifier: args[0], name: args.count > 2 ? args[2] : "")
 }
+
+if remoteOut { startRemote(bitRate: 4_000_000) }
 
 // MARK: - private frameworks
 
@@ -302,6 +319,7 @@ idle.setEventHandler {
 idle.resume()
 
 onKeyRequest = schedule
+onRemoteWake = schedule
 onLitChange = schedule
 startControl()
 
