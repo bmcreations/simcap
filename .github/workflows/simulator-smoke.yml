@@ -3,12 +3,15 @@ name: simulator smoke
 # Builds simcap on a hosted macOS runner, streams a simulator and sends it
 # input (ci/smoke.py). Hosted runners are virtual machines, so this is also
 # the check that capture and encode work without a physical GPU or display.
+#
+# The runner is xcode-27 because simcap links CoreDevice symbols that first
+# ship with Xcode 27; macos-26 stops at Xcode 26.6 and fails at link time.
 on:
   workflow_dispatch:
     inputs:
       runner:
         description: Runner label
-        default: macos-26
+        default: xcode-27
   pull_request:
     paths:
       - .github/workflows/simulator-smoke.yml
@@ -19,7 +22,7 @@ permissions:
 
 jobs:
   smoke:
-    runs-on: ${{ inputs.runner || 'macos-26' }}
+    runs-on: ${{ inputs.runner || 'xcode-27' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
