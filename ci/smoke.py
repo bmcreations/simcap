@@ -28,12 +28,17 @@ FLAG_KEY = 1 << 62
 
 
 def run(*cmd, timeout=120):
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return -1, f"timed out after {timeout}s"
     return p.returncode, (p.stdout + p.stderr).strip()
 
 
 def pick_simulator():
-    """The first available iPhone on the newest iOS runtime."""
+    """An ordinary iPhone on the newest iOS runtime. The iPhone Duo is passed
+    over when there is another: it is a foldable on its own runtime build, and
+    this check is about the host, not that device."""
     _, out = run("xcrun", "simctl", "list", "-j", "devices", "available")
     best = None
     for runtime, devices in json.loads(out)["devices"].items():
@@ -41,8 +46,11 @@ def pick_simulator():
             continue
         version = tuple(int(n) for n in runtime.rsplit("iOS-", 1)[-1].split("-") if n.isdigit())
         for d in devices:
-            if d["name"].startswith("iPhone") and (best is None or version > best[0]):
-                best = (version, d["udid"], d["name"], runtime)
+            if not d["name"].startswith("iPhone"):
+                continue
+            rank = ("Duo" not in d["name"], version)
+            if best is None or rank > best[0]:
+                best = (rank, d["udid"], d["name"], runtime)
     if best is None:
         sys.exit("no available iPhone simulator")
     return best[1], best[2], best[3]
@@ -103,8 +111,17 @@ def main():
     code, boot = run("xcrun", "simctl", "boot", udid, timeout=300)
     if code != 0 and "current state: Booted" not in boot:
         sys.exit(f"simctl boot failed: {boot}")
-    run("xcrun", "simctl", "bootstatus", udid, "-b", timeout=600)
-    note("Simulator", f"{name}  {udid}\n{runtime}\nbooted in {time.time() - t0:.0f}s")
+    code, status = run("xcrun", "simctl", "bootstatus", udid, "-b", timeout=600)
+    note("Simulator", f"{name}  {udid}\n{runtime}\nbootstatus exit {code} after {time.time() - t0:.0f}s\n{status[-600:]}")
+
+    # simctl's own screenshot before simcap touches the simulator. If this
+    # fails, the simulator is not drawing on this host and a simcap failure
+    # below says nothing about simcap.
+    t1 = time.time()
+    code, msg = run("xcrun", "simctl", "io", udid, "screenshot", os.path.join(out, "simctl-before.png"))
+    note("simctl screenshot before simcap", f"exit {code} in {time.time() - t1:.1f}s\n{msg}")
+    if code != 0:
+        failures.append("simulator: simctl could not take a screenshot before simcap started")
 
     stream = os.path.join(out, "stream.bin")
     with open(stream, "wb") as so, open(os.path.join(out, "simcap.log"), "wb") as se:
@@ -132,6 +149,9 @@ def main():
 
         time.sleep(max(0, CAPTURE_SECS - 3))
         early = cap.poll()
+        if early is None and os.path.getsize(stream) == 0:
+            # Nothing written: record where simcap is waiting.
+            note("simcap sample (no output yet)", run("sample", str(cap.pid), "2", "-mayDie")[1][:6000])
         cap.terminate()
         try:
             cap.wait(timeout=10)
@@ -152,7 +172,8 @@ def main():
         failures.append("stream: no keyframe")
 
     # simctl's own screenshot, for comparing against a decoded stream frame.
-    run("xcrun", "simctl", "io", udid, "screenshot", os.path.join(out, "simctl-screenshot.png"))
+    code, msg = run("xcrun", "simctl", "io", udid, "screenshot", os.path.join(out, "simctl-screenshot.png"))
+    note("simctl screenshot after simcap", f"exit {code}\n{msg}")
     if shutil.which("ffmpeg") and r["frames"]:
         frame = os.path.join(out, "stream-frame.png")
         code, msg = run("ffmpeg", "-y", "-loglevel", "error", "-i", h264, "-vf",
