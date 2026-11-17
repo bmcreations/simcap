@@ -404,6 +404,28 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
         }
     }
 
+    // warmHinge writes a foldable's hinge to the angle it already reads, once,
+    // when the input process starts. The first hinge write in a new input
+    // process took about 0.25 s longer than later ones (two relaunches each
+    // way, measured from loupe), and that first write is usually a fold
+    // someone is watching. Writing the angle the hinge reports moves nothing,
+    // where writing a remembered or default angle could fold a phone left
+    // half open. It runs here, on the reader thread, so a fold sent meanwhile
+    // waits behind it rather than being undone by it.
+    var warmed = false
+    func warmHinge() {
+        guard !warmed, let h = route() else { return }
+        warmed = true
+        let t0 = Date()
+        do {
+            guard let deg = try HingeReader.angle(h.device, seconds: 1) else { return }
+            try h.hinge(deg)
+            log(String(format: "hinge warmed at %.1f degrees in %.2fs", deg, Date().timeIntervalSince(t0)))
+        } catch {
+            log("hinge not warmed: \(error)")
+        }
+    }
+
     var pasteboard: Result<HubPasteboard, InputError>?
     var orientation: HubOrientation?
     Thread.detachNewThread {
@@ -416,6 +438,18 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
                     reply = "ok hub"
                 } else if case .failure(let e) = hub! {
                     reply = "ok legacy \(e)"
+                }
+                writeReply(reply)
+                warmHinge()
+                continue
+            }
+            if f[0] == "hingeangle" {
+                if let h = route() {
+                    do {
+                        reply = "ok " + (try HingeReader.angle(h.device).map { String(format: "%.1f", $0) } ?? "none")
+                    } catch { reply = "err \(error)" }
+                } else {
+                    reply = "err hingeangle needs CoreDevice, which did not open"
                 }
                 writeReply(reply)
                 continue
