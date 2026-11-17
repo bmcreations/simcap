@@ -410,7 +410,7 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
     // way, measured from loupe), and that first write is usually a fold
     // someone is watching. Writing the angle the hinge reports moves nothing,
     // where writing a remembered or default angle could fold a phone left
-    // half open. It runs here, on the reader thread, so a fold sent meanwhile
+    // half open. A hinge between its rests is left alone (see below). It runs here, on the reader thread, so a fold sent meanwhile
     // waits behind it rather than being undone by it.
     var warmed = false
     func warmHinge() {
@@ -419,6 +419,14 @@ func runInput(device: NSObject, udid: String, screen: @escaping () -> (Int, Int,
         let t0 = Date()
         do {
             guard let deg = try HingeReader.angle(h.device, seconds: 1) else { return }
+            // Only at a rest. On the iPhone Duo (iOS 27.2), a write at 114 or
+            // 120 degrees lit the cover for about a second before the inner
+            // panel came back, even though it was the angle the hinge read;
+            // writes at 0 and 180 left the lit panel alone.
+            guard deg <= 1 || deg >= 179 else {
+                log(String(format: "hinge not warmed: %.1f degrees is between rests", deg))
+                return
+            }
             try h.hinge(deg)
             log(String(format: "hinge warmed at %.1f degrees in %.2fs", deg, Date().timeIntervalSince(t0)))
         } catch {
