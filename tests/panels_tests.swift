@@ -26,6 +26,23 @@ func pick(_ c: [Candidate], panels: Int = 2, lit: LitDisplay?, last: LitDisplay?
         .map { (c[$0.index].width, c[$0.index].height, $0.turn, $0.id) }
 }
 
+// fixturePanels reads `devicectl device info displays --json-output` the way
+// pollLit reads CoreDevice's display list.
+func fixturePanels(_ name: String) -> [PanelState] {
+    let url = URL(fileURLWithPath: "tests/fixtures/\(name).json")
+    guard let data = try? Data(contentsOf: url),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let displays = (root["result"] as? [String: Any])?["displays"] as? [[String: Any]]
+    else { return [] }
+    return displays.filter { ($0["type"] as? [String: Any])?["integrated"] != nil }.map { d in
+        let size = d["nativeSize"] as? [Double] ?? [0, 0]
+        return PanelState(id: (d["displayId"] as? NSNumber)?.uint32Value ?? 0,
+                          width: Int(size[0]), height: Int(size[1]),
+                          active: d["active"] as? Bool ?? false,
+                          backlit: (d["backlightState"] as? String ?? "").hasPrefix("active"))
+    }
+}
+
 @main
 struct PanelsTests {
     static func main() {
@@ -105,6 +122,31 @@ struct PanelsTests {
         check(!buf.withUnsafeBytes { isSolidBlack($0.baseAddress!, width: w, height: h, bytesPerRow: bpr) }, "lit pixel")
         buf[46 * bpr + 46 * 4 + 1] = 8
         check(buf.withUnsafeBytes { isSolidBlack($0.baseAddress!, width: w, height: h, bytesPerRow: bpr) }, "near black")
+
+        // LitPicker, by the backlight, with the flags the Duo showed on
+        // 2026-11-17 (open and close through loupe, devicectl every ~85ms).
+        let closedDuo = fixturePanels("duo-active-flag-stuck")
+        check(closedDuo.count == 2, "fixture panels: \(closedDuo.count)")
+        var lp = LitPicker()
+        check(lp.pick(closedDuo, now: 0)?.id == 1, "closed Duo, active flag on the inner panel: outer")
+        func panels(outer: (Bool, Bool), inner: (Bool, Bool)) -> [PanelState] {
+            [PanelState(id: 1, width: 1398, height: 2034, active: outer.0, backlit: outer.1),
+             PanelState(id: 3, width: 2007, height: 2853, active: inner.0, backlit: inner.1)]
+        }
+        // Open: the outer backlight goes off as the inner one comes on.
+        check(lp.pick(panels(outer: (false, false), inner: (true, true)), now: 5_600 * ms)?.id == 3, "opened")
+        // Close: both backlit for ~3.4s, the outer one newest.
+        check(lp.pick(panels(outer: (false, true), inner: (true, true)), now: 11_800 * ms)?.id == 1, "closing, both backlit")
+        check(lp.pick(panels(outer: (false, true), inner: (true, true)), now: 14_000 * ms)?.id == 1, "closing, still both")
+        check(lp.pick(panels(outer: (false, true), inner: (true, false)), now: 15_200 * ms)?.id == 1, "closed")
+        // A process starting mid-close sees both at once: the active one.
+        lp = LitPicker()
+        check(lp.pick(panels(outer: (false, true), inner: (true, true)), now: 0)?.id == 3, "both on in the first read: active")
+        check(lp.pick(panels(outer: (false, true), inner: (true, false)), now: 3_400 * ms)?.id == 1, "then closed")
+        // Two on together and neither active, or none backlit: no lit panel.
+        lp = LitPicker()
+        check(lp.pick(panels(outer: (false, true), inner: (false, true)), now: 0) == nil, "two backlit, none active")
+        check(lp.pick(panels(outer: (true, false), inner: (true, false)), now: 0) == nil, "none backlit")
 
         print(failures == 0 ? "panels: all passed" : "panels: \(failures) failed")
         exit(failures == 0 ? 0 : 1)

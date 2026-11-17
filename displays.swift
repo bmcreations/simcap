@@ -187,16 +187,16 @@ func watchLitDisplay(udid: String) {
 private func pollLit(_ dev: RemoteDevice, _ first: DispatchSemaphore) async {
     var last: LitDisplay?
     var answered = false
+    var picker = LitPicker()
     while true {
         var lit: LitDisplay?
         if let info = try? await dev.displayInfo {
-            let on = info.displays.filter {
-                !$0.external && $0.active == true && $0.backlightState.rawValue.hasPrefix("active")
+            let panels = info.displays.filter { !$0.external }.map {
+                PanelState(id: $0.displayId, width: Int($0.nativeSize.width), height: Int($0.nativeSize.height),
+                           active: $0.active == true, backlit: $0.backlightState.rawValue.hasPrefix("active"))
             }
-            if on.count == 1 {
-                let id = on[0].displayId
-                lit = LitDisplay(width: Int(on[0].nativeSize.width), height: Int(on[0].nativeSize.height),
-                                 id: id, turn: panelSpec(id)?.turn ?? 0)
+            if let p = picker.pick(panels, now: DispatchTime.now().uptimeNanoseconds) {
+                lit = LitDisplay(width: p.width, height: p.height, id: p.id, turn: panelSpec(p.id)?.turn ?? 0)
             }
         }
         setLit(lit)

@@ -107,3 +107,39 @@ func isSolidBlack(_ base: UnsafeRawPointer, width: Int, height: Int, bytesPerRow
     }
     return true
 }
+
+// PanelState is one built-in display as CoreDevice's display list reports it:
+// whether it is marked active, and whether its backlight is on.
+struct PanelState: Equatable {
+    var id: UInt32, width: Int, height: Int
+    var active: Bool, backlit: Bool
+}
+
+// LitPicker names the lit panel from successive display lists by its
+// backlight. CoreDevice's `active` flag can't be relied on: on the iPhone Duo
+// simulator (iOS 27.1) it stays on the inner panel when the device closes, so
+// a closed Duo reads the outer panel backlit but inactive and the inner one
+// active with its backlight off (tests/fixtures/duo-active-flag-stuck.json),
+// and needing both flags answered posture none for every close.
+//
+// One panel backlit is the lit one. While a fold moves from one panel to the
+// other both backlights are on, for about 3.4s on a close, and the one that
+// came on last is the lit one. Two seen on together in the first read (a
+// process that starts mid-fold) fall back to the one marked active. None
+// backlit is no lit panel.
+struct LitPicker {
+    private var since: [UInt32: UInt64] = [:]
+
+    mutating func pick(_ panels: [PanelState], now: UInt64) -> PanelState? {
+        let backlit = panels.filter(\.backlit)
+        since = since.filter { id, _ in backlit.contains { $0.id == id } }
+        for p in backlit where since[p.id] == nil { since[p.id] = now }
+        if backlit.count == 1 { return backlit[0] }
+        guard backlit.count >= 2 else { return nil }
+        let newest = backlit.map { since[$0.id]! }.max()!
+        let last = backlit.filter { since[$0.id] == newest }
+        if last.count == 1 { return last[0] }
+        let active = last.filter(\.active)
+        return active.count == 1 ? active[0] : nil
+    }
+}
