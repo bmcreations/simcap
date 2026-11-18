@@ -3,7 +3,7 @@
 # CoreDeviceMediaStreamSupport, which -phone-wifi negotiates through, ships
 # nested inside CoreDevice.framework.
 CDMS_DIR := /Library/Developer/PrivateFrameworks/CoreDevice.framework/Versions/A/Frameworks
-SRC := main.swift input.swift ax.swift hub.swift orientation.swift pasteboard.swift displays.swift devices.swift \
+SRC := main.swift input.swift ax.swift hub.swift orientation.swift hinge.swift pasteboard.swift displays.swift devices.swift \
 	encoder.swift phone.swift phoneinput.swift phoneax.swift wifi.swift rtp.swift hostpasteboard.swift panels.swift sps.swift budget.swift
 
 .PHONY: simcap clean test
@@ -12,8 +12,10 @@ SRC := main.swift input.swift ax.swift hub.swift orientation.swift pasteboard.sw
 # capture survives a rebuild (sign.sh).
 simcap:
 	mkdir -p .build/coredevice
+	xcrun swiftc -emit-module -enable-library-evolution -parse-as-library -module-name CoreDeviceUtilities \
+		coredevice/CoreDeviceUtilities.swift -o .build/coredevice/CoreDeviceUtilities.swiftmodule
 	xcrun swiftc -emit-module -enable-library-evolution -parse-as-library -module-name CoreDevice \
-		coredevice/CoreDevice.swift -o .build/coredevice/CoreDevice.swiftmodule
+		-I .build/coredevice coredevice/CoreDevice.swift -o .build/coredevice/CoreDevice.swiftmodule
 	xcrun swiftc -emit-module -enable-library-evolution -parse-as-library -module-name CoreDeviceMediaStreamSupport \
 		-I .build/coredevice coredevice/CoreDeviceMediaStreamSupport.swift \
 		-o .build/coredevice/CoreDeviceMediaStreamSupport.swiftmodule

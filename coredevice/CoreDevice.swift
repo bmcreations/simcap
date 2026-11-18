@@ -2,6 +2,7 @@
 // on Xcode 27. Compiled into a .swiftmodule and never linked: simcap
 // links the real framework.
 import AppKit
+import CoreDeviceUtilities
 import Foundation
 
 public enum HIDButtonState: UInt8 { case up, down }
@@ -233,4 +234,21 @@ public struct OrientationControlCapability: DeviceCapability {
 extension CapabilityStaticMember where A: DeviceCapability {
   public static var createServiceSocket: CapabilityStaticMember<CreateServiceSocketCapability> { fatalError() }
   public static var orientationControl: CapabilityStaticMember<OrientationControlCapability> { fatalError() }
+}
+
+// The hinge's angle as the device reads it, which is what Device Hub's hinge
+// readout shows: a write sets where the hinge goes, and this says where it is.
+public struct DeviceMotionManager {
+  public var supportsHingeAngle: Bool { fatalError() }
+  public func monitorHingeAngle(config: HingeAngleStreamConfig) async throws(CoreDeviceError) -> AsyncThrowingStream<[DeviceHingeAngleSnapshot], Error> { fatalError() }
+}
+public protocol MonitorMotionProtocol: DeviceCapabilityProtocol {
+  func motionManager() async throws(CoreDeviceError) -> DeviceMotionManager
+}
+public struct MonitorMotionCapability: DeviceCapability {
+  public typealias ProtocolType = Any
+  public typealias ImplType = Any
+}
+extension CapabilityStaticMember where A: DeviceCapability {
+  public static var monitorMotion: CapabilityStaticMember<MonitorMotionCapability> { fatalError() }
 }
