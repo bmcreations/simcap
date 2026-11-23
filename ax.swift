@@ -92,6 +92,9 @@ final class AXTree {
         weak var parent: Elem?
         var children: [Elem] = []
         var frame: CGRect?
+        // A web page's element carries its web area's frame: a tap reaches
+        // the page only inside it.
+        var clip: CGRect?
         init(translation: NSObject?) { self.translation = translation }
 
         var json: [String: Any] {
@@ -258,12 +261,18 @@ final class AXTree {
     // on the Sign In button of tv.apple.com/search with the keyboard down.
     private func readWebArea(_ e: NSObject, parent: Elem, into all: inout [Elem]) -> Elem {
         let start = all.count
-        defer { for page in all[start...] { page.fields["focused"] = nil } }
+        let frame = (e.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue
         let el = Elem(translation: stamp(e))
+        defer {
+            for page in all[start...] {
+                page.fields["focused"] = nil
+                if page !== el { page.clip = frame }
+            }
+        }
         el.parent = parent
         all.append(el)
         el.fields = fields(e)
-        if let f = (e.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue { el.frame = f }
+        el.frame = frame
         var kids = (e.value(forKey: "accessibilityChildren") as? [NSObject]) ?? []
         if kids.isEmpty {
             let search: [String: Any] = [
@@ -342,6 +351,14 @@ final class AXTree {
     // cannot be placed is returned with its element: on a web page it is
     // how dump finds the page, and once the page is in the tree the hit is
     // tried again from `hits` rather than tested a second time.
+    //
+    // A page element whose centre is outside its web area is occluded
+    // without a hit test, which finds nothing there. Measured on
+    // tv.apple.com/search: Kids & Family's centre sat at y 782, between the
+    // web area's bottom at 776 and Safari's toolbar at 792; a hit test there
+    // found nothing, and a tap there did not follow the link. At the top
+    // edge, the page's search field scrolled under the status bar, centre at
+    // y 39 against the web area's top at 62, took no focus from a tap.
     private func markOccluded(_ els: [Elem], all: [Elem], screen: CGRect,
                               hits: [(el: Elem, hit: NSObject)] = []) -> [(el: Elem, hit: NSObject)] {
         typealias AtFn = @convention(c) (AnyObject, Selector, CGPoint, UInt32, AnyObject) -> Unmanaged<AnyObject>?
@@ -351,7 +368,12 @@ final class AXTree {
         var unplaced: [(el: Elem, hit: NSObject)] = []
         for el in els where el !== all.first {
             guard let f = el.frame, f.width > 0, f.height > 0 else { continue }
-            if !screen.isNull, !screen.contains(CGPoint(x: f.midX, y: f.midY)) {
+            let mid = CGPoint(x: f.midX, y: f.midY)
+            if !screen.isNull, !screen.contains(mid) {
+                el.fields["occluded"] = true
+                continue
+            }
+            if let clip = el.clip, !clip.contains(mid) {
                 el.fields["occluded"] = true
                 continue
             }
