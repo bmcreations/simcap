@@ -22,6 +22,16 @@ private let axFramework = "/System/Library/PrivateFrameworks/AccessibilityPlatfo
 // A tree deeper than this is a cycle, not an interface.
 private let maxDepth = 60
 
+// isWebContent reports whether pid is the process WebKit renders a
+// WKWebView's page in. The simulator's processes are this Mac's, so the
+// path is readable here: on iOS 27.2 it ends
+// WebContentExtension.appex/com.apple.WebKit.WebContent.
+private func isWebContent(_ pid: Int32) -> Bool {
+    var buf = [CChar](repeating: 0, count: 4096)
+    guard pid > 0, proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { return false }
+    return (String(cString: buf) as NSString).lastPathComponent == "com.apple.WebKit.WebContent"
+}
+
 final class AXTokenDelegate: NSObject {
     let device: NSObject
     let replies = DispatchQueue(label: "simcap.ax.replies")
@@ -145,15 +155,129 @@ final class AXTree {
         // The frames are already upright -- About in Settings read
         // (341,304) 525x50 on loupe-duo unfolded, where the screenshot has
         // it -- so only the root and the occlusion bounds take the lit size.
-        guard let lit = litDisplay(), let spec = panelSpec(lit.id), spec.scale > 0 else {
-            markOccluded(all, screen: all.first?.frame ?? .null)
-            return tree.json
+        var screen = all.first?.frame ?? .null
+        if let lit = litDisplay(), let spec = panelSpec(lit.id), spec.scale > 0 {
+            let (uw, uh) = turned(lit.width, lit.height, lit.turn)
+            screen = CGRect(x: 0, y: 0, width: Double(uw) / spec.scale, height: Double(uh) / spec.scale)
+            tree.fields["frame"] = [0, 0, screen.width, screen.height]
         }
-        let (uw, uh) = turned(lit.width, lit.height, lit.turn)
-        let screen = CGRect(x: 0, y: 0, width: Double(uw) / spec.scale, height: Double(uh) / spec.scale)
-        markOccluded(all, screen: screen)
-        tree.fields["frame"] = [0, 0, screen.width, screen.height]
+        let unplaced = markOccluded(all, all: all, screen: screen)
+        let webs = webAreas(unplaced.map(\.hit) + probe(all, screen: screen))
+        guard !webs.isEmpty else { return tree.json }
+        var added: [Elem] = []
+        for w in webs { tree.children.append(readWebArea(w, parent: tree, into: &added)) }
+        all += added
+        // Whatever the first pass could not place may sit under a page,
+        // which the second pass can now place.
+        _ = markOccluded(added + unplaced.map(\.el), all: all, screen: screen, hits: unplaced)
         return tree.json
+    }
+
+    // Web content is missing from the walk above. WebKit renders a
+    // WKWebView's page, Safari's included, in its own process, and the
+    // translator never links the two: Safari's application lists only its
+    // toolbar, and the page's root, the web area, has no parent and no
+    // accessibilityChildren. A hit test on the page does reach it, and
+    // descendants below the web area answer accessibilityChildren as usual.
+    // Measured in Safari on tv.apple.com/search, iPhone 18 Pro simulator,
+    // iOS 27.2: the dump held Back, Page Menu, Address, Tabs and one more
+    // button; a hit at (50,255) found the Browse heading in pid
+    // com.apple.WebKit.WebContent, whose parents ended at an AXGroup titled
+    // Apple TV, frame (0,62) 402x714, with no children.
+    //
+    // webAreas climbs each hit in a WebContent process to its topmost
+    // ancestor, the web area, and keeps each web area once. A hit in any
+    // other process is skipped before the climb, which is one request per
+    // parent: on a native screen every probe that misses the walk's leaves
+    // lands in the app's own process.
+    private func webAreas(_ hits: [NSObject]) -> [NSObject] {
+        var found: [NSObject] = []
+        for hit in hits {
+            guard let pid = (hit.value(forKey: "pid") as? NSNumber)?.int32Value, isWebContent(pid) else { continue }
+            hit.setValue(token, forKey: "bridgeDelegateToken")
+            guard var cur = translator.perform(NSSelectorFromString("macPlatformElementFromTranslation:"), with: hit)?
+                .takeUnretainedValue() as? NSObject
+            else { continue }
+            for _ in 0..<maxDepth {
+                guard let parent = cur.value(forKey: "accessibilityParent") as? NSObject else { break }
+                cur = parent
+            }
+            guard let t = stamp(cur), !found.contains(where: { stamp($0)?.isEqual(t) ?? false }) else { continue }
+            found.append(cur)
+        }
+        return found
+    }
+
+    // probe hit-tests a grid over the screen for content the walk never
+    // met, skipping points a leaf the walk did meet already covers: on a
+    // native screen most of the grid lands in rows and buttons and costs
+    // nothing. A point that finds an element the walk has is dropped.
+    // 4x8 cells, 100x109 points on an iPhone 18 Pro: a web view smaller than
+    // a cell can fall between the points.
+    private func probe(_ all: [Elem], screen: CGRect) -> [NSObject] {
+        guard !screen.isNull, screen.width > 0, screen.height > 0 else { return [] }
+        typealias AtFn = @convention(c) (AnyObject, Selector, CGPoint, UInt32, AnyObject) -> Unmanaged<AnyObject>?
+        let sel = NSSelectorFromString("objectAtPoint:displayId:bridgeDelegateToken:")
+        guard let imp = class_getMethodImplementation(type(of: translator), sel) else { return [] }
+        let at = unsafeBitCast(imp, to: AtFn.self)
+        let leaves = all.dropFirst().compactMap { $0.children.isEmpty ? $0.frame : nil }
+        var covered: [CGRect] = []
+        var hits: [NSObject] = []
+        let cols = 4, rows = 8
+        for r in 0..<rows {
+            for c in 0..<cols {
+                let pt = CGPoint(x: screen.minX + screen.width * (Double(c) + 0.5) / Double(cols),
+                                 y: screen.minY + screen.height * (Double(r) + 0.5) / Double(rows))
+                if leaves.contains(where: { $0.contains(pt) }) || covered.contains(where: { $0.contains(pt) }) { continue }
+                guard let hit = at(translator, sel, pt, 0, token)?.takeUnretainedValue() as? NSObject,
+                      place(hit, in: all) == nil
+                else { continue }
+                hits.append(hit)
+                // Every other point on the same page finds the same web area.
+                if let web = webAreas([hit]).first,
+                   let f = (web.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue {
+                    covered.append(f)
+                }
+            }
+        }
+        return hits
+    }
+
+    // The web area answers no accessibilityChildren; a search for its
+    // immediate descendants gives them, 6 on tv.apple.com/search, and the
+    // walk takes over from there.
+    //
+    // Only a WebKit element can be asked this. UIKit answers the same search
+    // on an application element by throwing from rangeOfString: inside
+    // -[UIApplicationAccessibility _accessibilityElementsForSearchParameter:],
+    // which aborted Safari and then SpringBoard on that simulator.
+    //
+    // focused is dropped from the page: WebKit answers AXFocused true on
+    // every element of it, the web area too, while Safari's Back button
+    // answers false, and the web area's AXFocusedUIElement is nil. Measured
+    // on the Sign In button of tv.apple.com/search with the keyboard down.
+    private func readWebArea(_ e: NSObject, parent: Elem, into all: inout [Elem]) -> Elem {
+        let start = all.count
+        defer { for page in all[start...] { page.fields["focused"] = nil } }
+        let el = Elem(translation: stamp(e))
+        el.parent = parent
+        all.append(el)
+        el.fields = fields(e)
+        if let f = (e.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue { el.frame = f }
+        var kids = (e.value(forKey: "accessibilityChildren") as? [NSObject]) ?? []
+        if kids.isEmpty {
+            let search: [String: Any] = [
+                "AXSearchKey": "AXAnyTypeSearchKey",
+                "AXDirection": "AXDirectionNext",
+                "AXImmediateDescendantsOnly": true,
+                "AXResultsLimit": 1000,
+            ]
+            kids = (e.perform(NSSelectorFromString("accessibilityAttributeValue:forParameter:"),
+                              with: "AXUIElementsForSearchPredicate", with: search)?
+                .takeUnretainedValue() as? [NSObject]) ?? []
+        }
+        el.children = kids.map { read($0, parent: el, depth: 2, into: &all) }
+        return el
     }
 
     // Every element carries its own translation, and each needs the token, or
@@ -214,25 +338,35 @@ final class AXTree {
     // were marked; Appearance, under the blank area, was not.
     //
     // A hit the dump did not reach is placed by walking up its parents to
-    // one that it did. A hit on nothing proves nothing.
-    private func markOccluded(_ all: [Elem], screen: CGRect) {
+    // one that it did. A hit on nothing proves nothing, and a hit that
+    // cannot be placed is returned with its element: on a web page it is
+    // how dump finds the page, and once the page is in the tree the hit is
+    // tried again from `hits` rather than tested a second time.
+    private func markOccluded(_ els: [Elem], all: [Elem], screen: CGRect,
+                              hits: [(el: Elem, hit: NSObject)] = []) -> [(el: Elem, hit: NSObject)] {
         typealias AtFn = @convention(c) (AnyObject, Selector, CGPoint, UInt32, AnyObject) -> Unmanaged<AnyObject>?
         let sel = NSSelectorFromString("objectAtPoint:displayId:bridgeDelegateToken:")
-        guard let imp = class_getMethodImplementation(type(of: translator), sel) else { return }
+        guard let imp = class_getMethodImplementation(type(of: translator), sel) else { return [] }
         let at = unsafeBitCast(imp, to: AtFn.self)
-        for el in all.dropFirst() {
+        var unplaced: [(el: Elem, hit: NSObject)] = []
+        for el in els where el !== all.first {
             guard let f = el.frame, f.width > 0, f.height > 0 else { continue }
             if !screen.isNull, !screen.contains(CGPoint(x: f.midX, y: f.midY)) {
                 el.fields["occluded"] = true
                 continue
             }
-            guard let hit = at(translator, sel, CGPoint(x: f.midX, y: f.midY), 0, token)?.takeUnretainedValue() as? NSObject,
-                  let top = place(hit, in: all)
+            guard let hit = hits.first(where: { $0.el === el })?.hit
+                ?? at(translator, sel, CGPoint(x: f.midX, y: f.midY), 0, token)?.takeUnretainedValue() as? NSObject
             else { continue }
+            guard let top = place(hit, in: all) else {
+                unplaced.append((el, hit))
+                continue
+            }
             var cur: Elem? = top
             while let c = cur, c !== el { cur = c.parent }
             if cur == nil { el.fields["occluded"] = true }
         }
+        return unplaced
     }
 
     private func place(_ hit: NSObject, in all: [Elem]) -> Elem? {
