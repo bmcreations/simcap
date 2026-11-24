@@ -4,7 +4,7 @@
 # nested inside CoreDevice.framework.
 CDMS_DIR := /Library/Developer/PrivateFrameworks/CoreDevice.framework/Versions/A/Frameworks
 SRC := main.swift input.swift ax.swift hub.swift orientation.swift hinge.swift pasteboard.swift displays.swift devices.swift \
-	encoder.swift phone.swift phoneinput.swift phoneax.swift wifi.swift rtp.swift hostpasteboard.swift panels.swift sps.swift budget.swift
+	encoder.swift phone.swift phoneinput.swift phoneax.swift wifi.swift rtp.swift hostpasteboard.swift panels.swift sps.swift budget.swift occlusion.swift
 
 .PHONY: simcap clean test
 
@@ -56,6 +56,8 @@ test:
 	.build/sps_tests
 	xcrun swiftc -parse-as-library budget.swift tests/budget_tests.swift -o .build/budget_tests
 	.build/budget_tests
+	xcrun swiftc -parse-as-library occlusion.swift tests/occlusion_tests.swift -o .build/occlusion_tests
+	.build/occlusion_tests
 
 clean:
 	rm -rf .build
