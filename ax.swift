@@ -350,7 +350,8 @@ final class AXTree {
     // one that it did. A hit on nothing proves nothing, and a hit that
     // cannot be placed is returned with its element: on a web page it is
     // how dump finds the page, and once the page is in the tree the hit is
-    // tried again from `hits` rather than tested a second time.
+    // tried again from `hits` rather than tested a second time. On a page
+    // element either one means the centre is outside the page (occlusion.swift).
     //
     // A page element whose centre is outside its web area is occluded
     // without a hit test, which finds nothing there. Measured on
@@ -377,16 +378,14 @@ final class AXTree {
                 el.fields["occluded"] = true
                 continue
             }
-            guard let hit = hits.first(where: { $0.el === el })?.hit
-                ?? at(translator, sel, CGPoint(x: f.midX, y: f.midY), 0, token)?.takeUnretainedValue() as? NSObject
-            else { continue }
-            guard let top = place(hit, in: all) else {
-                unplaced.append((el, hit))
-                continue
-            }
-            var cur: Elem? = top
+            let hit = hits.first(where: { $0.el === el })?.hit
+                ?? at(translator, sel, mid, 0, token)?.takeUnretainedValue() as? NSObject
+            let top = hit.flatMap { place($0, in: all) }
+            if let hit, top == nil { unplaced.append((el, hit)) }
+            var cur = top
             while let c = cur, c !== el { cur = c.parent }
-            if cur == nil { el.fields["occluded"] = true }
+            let found: CentreHit = hit == nil ? .nothing : top == nil ? .unplaced : cur == nil ? .other : .element
+            if occluded(found, onPage: el.clip != nil) { el.fields["occluded"] = true }
         }
         return unplaced
     }
